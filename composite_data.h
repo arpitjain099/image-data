@@ -80,6 +80,49 @@ namespace rsvp
          * @param enable true to enable bilinear interpolation, false for nearest-neighbor
          */
         void set_interpolating(bool enable) override;
+
+        /**
+         * @brief Blend the edge samples of every child within a pixel of
+         * (x, y), and report the largest of their weights.
+         *
+         * @see ImageData::get_clamped_pixel_double
+         */
+        bool get_clamped_pixel_double(double &value,
+                                      double &weight,
+                                      double x,
+                                      double y,
+                                      int band) const override;
+
+    protected:
+        /**
+         * @brief Reconstruct a value in the band between abutting images.
+         *
+         * Tiled DEM mosaics abut without overlapping, so there is a
+         * one-pixel-wide band along every seam that no single tile can
+         * interpolate - each of the four bilinear corners the band needs lives
+         * in a different tile. This blends the edge value of every child
+         * within a pixel of (x, y), weighted by how close that edge is.
+         *
+         * For grids that share a pitch and a phase, which tiles cut from a
+         * common mosaic do, the result is exactly the bilinear interpolation
+         * the tiles would produce if they were a single image.
+         *
+         * This is meant as a fallback for the seam band, so callers should try
+         * their normal compositing first: inside a tile this returns the same
+         * answer, but more expensively.
+         *
+         * @param[out] value The reconstructed value.
+         * @param[in] x      The "x-like" coordinate of the pixel of interest
+         * @param[in] y      The "y-like" coordinate of the pixel of interest
+         * @param[in] band   The band of the pixel to access
+         *
+         * @return false if no child is within a pixel of (x, y), which means
+         * (x, y) is genuinely outside the composite rather than on a seam.
+         */
+        bool get_seam_pixel_double(double &value,
+                                   double x,
+                                   double y,
+                                   int band) const;
     };
 
     /**
@@ -134,39 +177,6 @@ namespace rsvp
     {
     public:
 
-        // Return an exact pixel value as a double
-        virtual bool get_pixel_double(double &value,
-                                      const int x,
-                                      const int y,
-                                      const int band) const override;
-
-        // Return an interpolated pixel value as a double
-        virtual bool get_interpolated_pixel_double(
-            double &value,
-            const double x,
-            const double y,
-            const int band) const override;
-    };
-
-    /**
-     * @brief A class that returns the first valid pixel without blending.
-     *
-     * This composite type is useful for orbital DEMs where tiles have
-     * identical edge pixels. It avoids blending different bilinear
-     * interpolations of the same location, which can create artificial
-     * discontinuities at tile boundaries.
-     *
-     * Heightmap-style ImageData objects have three bands:
-     *
-     *  0: Real, uninterpolated height values, or 3.4e38 if no data is present.
-     *  1: Interpolated height values.
-     *  2: Alpha value. 255 if uniterpolated data is present, decaying by
-     *     12.5/pixel away from uniterpolated data to a minimum of 1.
-     *
-     */
-    class FirstValidCompositeData final : public CompositeData
-    {
-    public:
         // Return an exact pixel value as a double
         virtual bool get_pixel_double(double &value,
                                       const int x,
