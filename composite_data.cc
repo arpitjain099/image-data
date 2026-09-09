@@ -2,6 +2,8 @@
 
 #include <stdexcept>
 
+#include <algorithm>
+#include <cstddef>
 #include <limits>
 #include <list>
 
@@ -18,6 +20,16 @@ namespace rsvp
         // and filling it in would be extrapolating, not interpolating. The
         // slack absorbs the rounding in the images' placements.
         const double minimum_enclosing_weight = 1.0 - 1e-6;
+
+        // How far outside a composite's bounds still counts as inside when
+        // ruling out (x, y) being on a seam. Bounds are derived from the
+        // images' labels and transforms while pixel lookups go through the
+        // inverted transforms, so the two can disagree in the last bits, and
+        // rejecting a point the pixels do cover would put a hole in the
+        // terrain. A micron is many orders of magnitude above that
+        // disagreement and many below the pitch of any real terrain, so it
+        // cannot hide a seam either.
+        const double bounds_margin = 1e-6;
     }
 
     CompositeData::CompositeData() = default;
@@ -74,6 +86,8 @@ namespace rsvp
         {
             images.insert(images.begin() + position, img);
         }
+
+        invalidate_geometry();
     }
 
     std::shared_ptr<rsvp::ImageData> CompositeData::remove_image(int position)
@@ -85,6 +99,7 @@ namespace rsvp
 
             // Update the list
             images.erase(images.begin() + position);
+            invalidate_geometry();
 
             return removed_image;
         }
@@ -100,6 +115,7 @@ namespace rsvp
         {
             // Update the list
             images.erase(images.begin() + position);
+            invalidate_geometry();
             return true;
         }
         else
@@ -129,17 +145,46 @@ namespace rsvp
         double weighted_sum = 0.0;
         double summed_alpha = 0.0;
 
+        const std::vector<ChildGeometry> &children = child_geometry();
+
         for (int i = 0; i < get_count(); i++)
         {
             double height = 0.0;
             double alpha = 0.0;
 
-            if (!images.at(i)->get_interpolated_pixel_double(
-                    height, x, y, b) ||
-                !images.at(i)->get_interpolated_pixel_double(alpha, x, y, 2))
+            if (children.at(i).bands == 1)
             {
-                // If this image doesn't have a value or an alpha value at this
-                // point, skip it
+                // Usually we composite `VicarData` images, which have three
+                // bands (raw, interpolated, alpha), but we also want to
+                // support using `PGMData` images (one raw band). Switch the
+                // user-requested band for band 0.
+                if (!images.at(i)->get_interpolated_pixel_double(
+                        height, x, y, 0))
+                {
+                    continue;
+                }
+
+                // PGMs have no alpha channel, so fake that they are all
+                // opaque.
+                alpha = 255.0;
+            }
+            else if (!images.at(i)->get_interpolated_pixel_double(
+                         height, x, y, b))
+            {
+                // Coordinates are out of bounds of image data, so skip this
+                // image
+                continue;
+            }
+            else if (const int band_with_alpha = children.at(i).alpha_band;
+                     band_with_alpha < 0)
+            {
+                // Nothing to say how opaque it is, so just call it opaque.
+                alpha = 255.0;
+            }
+            else if (!images.at(i)->get_interpolated_pixel_double(
+                         alpha, x, y, band_with_alpha))
+            {
+                // Valid data value, but no alpha value at this pixel
                 continue;
             }
 
@@ -203,12 +248,14 @@ namespace rsvp
         double total_alpha = 0.0;
         value = 0.0;
 
+        const std::vector<ChildGeometry> &children = child_geometry();
+
         for (int i = 0; i < get_count(); i++)
         {
             double current_height = 0.0;
             double current_alpha = 0.0;
 
-            if (images.at(i)->get_bands() == 1)
+            if (children.at(i).bands == 1)
             {
                 // Usually we composite `VicarData` images, which have three
                 // bands (raw, interpolated, alpha), but we also want to
@@ -239,16 +286,15 @@ namespace rsvp
                 }
 
                 // Get the alpha value
-                if (images.at(i)->get_alpha_band() < 0)
+                const int band_with_alpha = children.at(i).alpha_band;
+
+                if (band_with_alpha < 0)
                 {
-                    // No alpha band defined for image, so just call it opaque.
+                    // Nothing to say how opaque it is, so just call it opaque.
                     current_alpha = 255.0;
                 }
                 else if (!images.at(i)->get_interpolated_pixel_double(
-                             current_alpha,
-                             x,
-                             y,
-                             images.at(i)->get_alpha_band()))
+                             current_alpha, x, y, band_with_alpha))
                 {
                     // Valid data value, but no alpha value at this pixel
                     // This should not be able to happen
@@ -363,21 +409,40 @@ namespace rsvp
         }
 
         // No image covers (x, y). It may still land in the band between
-        // abutting images, which none of them can interpolate on its own. Take
-        // the value from the nearest image rather than blending across the
-        // seam like the height composites do - these bands hold terrain type
-        // identifiers, and the average of two identifiers is a third,
+        // abutting images, which none of them can interpolate on its own.
+        if (!could_be_on_seam(x, y))
+        {
+            return false;
+        }
+
+        // Take the value from the nearest image rather than blending across
+        // the seam like the height composites do - these bands hold terrain
+        // type identifiers, and the average of two identifiers is a third,
         // unrelated one.
         double max_weight = 0.0;
         double summed_weight = 0.0;
         double nearest_value = 0.0;
 
+        const std::vector<ChildGeometry> &children = child_geometry();
+
         for (int i = 0; i < get_count(); i++)
         {
+            const auto &image = images.at(i);
+
+            // Only the images flanking the seam have a say
+            if (!image || !child_may_reach(children.at(i), x, y))
+            {
+                continue;
+            }
+
             double current_value = 0.0;
             double current_weight = 0.0;
 
-            if (!images.at(i)->get_clamped_pixel_double(
+            // No alpha test here, unlike get_seam_pixel_double: a scored
+            // composite takes the best-scoring image everywhere else without
+            // ruling out low scores, and a seam should look like the rest of
+            // the composite rather than follow a stricter rule of its own.
+            if (!image->get_clamped_pixel_double(
                     current_value, current_weight, x, y, b))
             {
                 continue;
@@ -403,20 +468,174 @@ namespace rsvp
         return true;
     }
 
-    TerrainBounds CompositeData::get_bounds() const
+    double CompositeData::get_clamp_reach_of(const ImageData &image,
+                                             const TerrainBounds &bounds)
     {
-        TerrainBounds combined_bounds;
-
-        for (const auto &image : images)
+        if (!bounds.valid)
         {
-            if (image)
-            {
-                TerrainBounds image_bounds = image->get_bounds();
-                combined_bounds.merge(image_bounds);
-            }
+            return 0.0;
         }
 
-        return combined_bounds;
+        const int width = image.get_width();
+        const int height = image.get_height();
+
+        if (width < 2 || height < 2)
+        {
+            // Nothing to measure a pixel against. An image with no grid of its
+            // own is a container of images that are already placed, and how
+            // far past its edge it can still reach is a question for whichever
+            // of those the point is near.
+            return 0.0;
+        }
+
+        // A clamped sample reaches one of the image's own pixels past its
+        // edge, so the reach we want is that pixel's pitch in our coordinates.
+        //
+        // Bounds are axis-aligned, so for a rotated image each span covers
+        // more ground than the pitch along that axis. Taking the larger of the
+        // two estimates is therefore never short of the true pitch, whatever
+        // the rotation, and erring long only costs us a cull we could have
+        // made.
+        return std::max(bounds.get_width() / (width - 1),
+                        bounds.get_height() / (height - 1));
+    }
+
+    void CompositeData::refresh_geometry_cache() const
+    {
+        const unsigned long version = geometry_version();
+
+        if (cached_geometry_version == version)
+        {
+            return;
+        }
+
+        TerrainBounds combined_bounds;
+
+        cached_children.clear();
+        cached_children.resize(images.size());
+
+        for (size_t i = 0; i < images.size(); i++)
+        {
+            const auto &image = images.at(i);
+
+            if (!image)
+            {
+                // Leave the entry at its defaults so the indices still line up
+                continue;
+            }
+
+            ChildGeometry &info = cached_children.at(i);
+
+            info.bounds = image->get_bounds();
+            info.clamp_reach = get_clamp_reach_of(*image, info.bounds);
+            info.bands = image->get_bands();
+            info.alpha_band = get_alpha_band_of(*image);
+
+            combined_bounds.merge(info.bounds);
+        }
+
+        cached_bounds = combined_bounds;
+        cached_geometry_version = version;
+    }
+
+    const TerrainBounds &CompositeData::merged_bounds() const
+    {
+        // Only for the side effect of refilling the cache the bounds live in
+        child_geometry();
+
+        return cached_bounds;
+    }
+
+    bool CompositeData::child_may_reach(const ChildGeometry &info,
+                                        const double x,
+                                        const double y)
+    {
+        if (!info.bounds.valid || info.clamp_reach <= 0.0)
+        {
+            // Nothing known about the child, so nothing ruled out
+            return true;
+        }
+
+        return info.bounds.contains(x, y, info.clamp_reach + bounds_margin);
+    }
+
+    TerrainBounds CompositeData::get_bounds() const
+    {
+        return merged_bounds();
+    }
+
+    bool CompositeData::could_be_on_seam(const double x, const double y) const
+    {
+        // It takes two images to have a band between them
+        if (get_count() < 2)
+        {
+            return false;
+        }
+
+        // Seams run between the images, so a point beyond the outer edge of
+        // all of them is not on one. Images that do not know where they are
+        // leave the bounds invalid, and then this rules nothing out.
+        const TerrainBounds &bounds = merged_bounds();
+
+        return !bounds.valid || bounds.contains(x, y, bounds_margin);
+    }
+
+    int CompositeData::get_alpha_band_of(const ImageData &image)
+    {
+        if (image.get_bands() <= 1)
+        {
+            // A single-band image - a PGM - carries no alpha at all
+            return -1;
+        }
+
+        const int declared_band = image.get_alpha_band();
+
+        if (declared_band >= 0)
+        {
+            return declared_band;
+        }
+
+        // The image has not said where its alpha is. `ModData` labels every
+        // image it reads, so this only comes up for images assembled by hand,
+        // and for those the format is the best guide there is: a three-band
+        // heightmap keeps its alpha in band 2.
+        return (image.get_bands() > 2) ? 2 : -1;
+    }
+
+    bool CompositeData::get_seam_sample(const ImageData &image,
+                                        const ChildGeometry &info,
+                                        double &value,
+                                        double &weight,
+                                        const double x,
+                                        const double y,
+                                        const int band) const
+    {
+        if (!image.get_clamped_pixel_double(value, weight, x, y, band))
+        {
+            // More than a pixel away from this image, so it is not one of the
+            // images sharing this seam.
+            return false;
+        }
+
+        const int band_with_alpha = info.alpha_band;
+
+        if (band_with_alpha < 0)
+        {
+            // Nothing to say whether the data is real, so take it as real
+            return true;
+        }
+
+        double alpha = 0.0;
+        double alpha_weight = 0.0;
+
+        if (!image.get_clamped_pixel_double(
+                alpha, alpha_weight, x, y, band_with_alpha))
+        {
+            return false;
+        }
+
+        // The minimum alpha value means there is no real data here
+        return alpha >= 1.01;
     }
 
     bool CompositeData::get_seam_pixel_double(double &value,
@@ -424,41 +643,35 @@ namespace rsvp
                                               const double y,
                                               const int band) const
     {
+        if (!could_be_on_seam(x, y))
+        {
+            return false;
+        }
+
         double weighted_sum = 0.0;
         double summed_weight = 0.0;
 
-        for (const auto &image : images)
-        {
-            double current_value = 0.0;
-            double current_weight = 0.0;
+        const std::vector<ChildGeometry> &children = child_geometry();
 
-            if (!image->get_clamped_pixel_double(
-                    current_value, current_weight, x, y, band))
+        for (size_t i = 0; i < images.size(); i++)
+        {
+            const auto &image = images.at(i);
+            const ChildGeometry &info = children.at(i);
+
+            // Only the one or two images flanking the seam have a say, so rule
+            // the rest out before walking down into them
+            if (!image || !child_may_reach(info, x, y))
             {
-                // More than a pixel away from this image, so it is not one of
-                // the images sharing this seam.
                 continue;
             }
 
-            if (image->get_bands() > 1 && image->get_alpha_band() >= 0)
+            double current_value = 0.0;
+            double current_weight = 0.0;
+
+            if (!get_seam_sample(
+                    *image, info, current_value, current_weight, x, y, band))
             {
-                double current_alpha = 0.0;
-                double alpha_weight = 0.0;
-
-                if (!image->get_clamped_pixel_double(current_alpha,
-                                                     alpha_weight,
-                                                     x,
-                                                     y,
-                                                     image->get_alpha_band()))
-                {
-                    continue;
-                }
-
-                if (current_alpha < 1.01)
-                {
-                    // The minimum alpha value means there is no real data here
-                    continue;
-                }
+                continue;
             }
 
             weighted_sum += current_weight * current_value;
@@ -492,8 +705,18 @@ namespace rsvp
         // edge of whichever child lies nearest to it.
         double largest_weight = 0.0;
 
-        for (const auto &image : images)
+        const std::vector<ChildGeometry> &children = child_geometry();
+
+        for (size_t i = 0; i < images.size(); i++)
         {
+            const auto &image = images.at(i);
+
+            // Only a child within a pixel of (x, y) can be the nearest one
+            if (!image || !child_may_reach(children.at(i), x, y))
+            {
+                continue;
+            }
+
             double current_value = 0.0;
             double current_weight = 0.0;
 

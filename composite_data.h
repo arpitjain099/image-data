@@ -14,7 +14,105 @@ namespace rsvp
     {
 
     protected:
+        /**
+         * @brief What a composite needs to know about one of its children but
+         * cannot afford to ask for once per pixel.
+         *
+         * Asking a child where it is means parsing its labels, and asking
+         * which band holds its alpha walks the chain of wrappers around it.
+         * Both answers hold until an image moves or is relabelled.
+         */
+        struct ChildGeometry
+        {
+            /// Where the child sits, in this composite's coordinates.
+            TerrainBounds bounds;
+
+            /**
+             * How far outside `bounds` the child can still answer a clamped
+             * sample: one of its pixels, measured in this composite's units.
+             *
+             * Zero means "unknown" - the child has no pixel grid of its own to
+             * measure a pixel against - and suppresses culling rather than
+             * risking a cull of a child that would have answered.
+             */
+            double clamp_reach = 0.0;
+
+            /// How many bands the child has.
+            int bands = 0;
+
+            /// Which of those bands carries alpha, or -1 for none.
+            int alpha_band = -1;
+        };
+
         std::vector<std::shared_ptr<rsvp::ImageData> > images;
+
+        /**
+         * @brief What is known about each child, in the same order as
+         * `images`, recomputed only when an image has moved or been relabelled
+         * since it was last worked out.
+         *
+         * Entries for null children are present but left at their defaults, so
+         * that indices line up with `images`.
+         *
+         * Every pixel lookup consults this, so the check that the cache is
+         * still good is kept here to be inlined, and only the refill is a
+         * call.
+         */
+        const std::vector<ChildGeometry> &child_geometry() const
+        {
+            if (cached_geometry_version != geometry_version())
+            {
+                refresh_geometry_cache();
+            }
+
+            return cached_children;
+        }
+
+        /**
+         * @brief The merged bounds of the children.
+         *
+         * Returns a reference because pixel lookups consult this and do not
+         * need a copy.
+         */
+        const TerrainBounds &merged_bounds() const;
+
+        /**
+         * @brief Cheaply rule out a child being able to supply a clamped
+         * sample at (x, y).
+         *
+         * Sampling a child to find out costs a walk down its chain of wrappers
+         * and a bilinear fetch, and along a seam all but one or two of the
+         * children are nowhere near the point, so it pays to ask this first.
+         *
+         * @param[in] info The child to test
+         * @param[in] x    The "x-like" coordinate of the pixel of interest
+         * @param[in] y    The "y-like" coordinate of the pixel of interest
+         *
+         * @return false if the child is certainly too far from (x, y) to have
+         * a say. true means only that it might.
+         */
+        static bool
+        child_may_reach(const ChildGeometry &info, double x, double y);
+
+    private:
+        mutable std::vector<ChildGeometry> cached_children;
+        mutable TerrainBounds cached_bounds;
+        mutable unsigned long cached_geometry_version = 0;
+
+        /**
+         * @brief Bring `cached_children` and `cached_bounds` up to date, if an
+         * image has moved or been relabelled since they were filled in.
+         */
+        void refresh_geometry_cache() const;
+
+        /**
+         * @brief Work out how far outside its bounds an image can still answer
+         * a clamped sample.
+         *
+         * @see ChildGeometry::clamp_reach
+         */
+        static double get_clamp_reach_of(const ImageData &image,
+                                         const TerrainBounds &bounds);
 
     public:
         /**
@@ -123,6 +221,68 @@ namespace rsvp
                                    double x,
                                    double y,
                                    int band) const;
+
+        /**
+         * @brief Cheaply rule out (x, y) being on one of this composite's
+         * seams.
+         *
+         * A seam is a band between two images, so it takes two images to have
+         * one, and it lies inside the composite rather than beyond its outer
+         * edge. Both are much cheaper to check than the sample-every-child
+         * loops that reconstruct a seam, and out-of-terrain lookups are common
+         * enough to be worth the check.
+         *
+         * @param[in] x The "x-like" coordinate of the pixel of interest
+         * @param[in] y The "y-like" coordinate of the pixel of interest
+         *
+         * @return false if (x, y) cannot be on a seam. true means only that it
+         * might be.
+         */
+        bool could_be_on_seam(double x, double y) const;
+
+        /**
+         * @brief Work out which band of an image carries its alpha value.
+         *
+         * Prefers what the image declares. An image that declares nothing
+         * falls back on its format: a single-band PGM has no alpha, and a
+         * three-band heightmap or terrain classification keeps it in band 2.
+         *
+         * Every composite here resolves the alpha band through this, so that a
+         * seam is judged opaque or transparent by the same rule as the pixels
+         * on either side of it.
+         *
+         * @param[in] image The image to inspect
+         *
+         * @return The band carrying alpha, or -1 if the image has none.
+         */
+        static int get_alpha_band_of(const ImageData &image);
+
+        /**
+         * @brief Sample one child of the composite for a seam reconstruction.
+         *
+         * Takes the child's value at the point on its edge nearest to (x, y)
+         * along with the weight that point is owed, and rejects children that
+         * hold no real data there.
+         *
+         * @param[in]  image  The child to sample
+         * @param[in]  info   What is cached about `image`
+         * @param[out] value  The value sampled from `image`
+         * @param[out] weight The weight `value` is owed
+         * @param[in]  x      The "x-like" coordinate of the pixel of interest
+         * @param[in]  y      The "y-like" coordinate of the pixel of interest
+         * @param[in]  band   The band of the pixel to access
+         *
+         * @return false if `image` is more than a pixel from (x, y), or is
+         * transparent there, either of which means it does not share this
+         * seam.
+         */
+        bool get_seam_sample(const ImageData &image,
+                             const ChildGeometry &info,
+                             double &value,
+                             double &weight,
+                             double x,
+                             double y,
+                             int band) const;
     };
 
     /**
