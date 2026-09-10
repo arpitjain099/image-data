@@ -3,12 +3,30 @@
 
 #include "image_data.h"
 
+#include <atomic>
+#include <mutex>
+
 
 namespace rsvp
 {
 
     /**
      * @brief A class to composite multiple ImageData objects together.
+     *
+     * Pixel lookups are safe to run from several threads at once. Everything
+     * else is not: adding, removing or moving a child while a lookup is in
+     * flight races with that lookup, both over the list of children and over
+     * the child's own transform. Place the children first, then sample.
+     *
+     * A composite works out where its children sit once and holds on to that
+     * answer, and a lookup reads it without locking. That costs a small amount
+     * of memory each time the children genuinely change, which is never given
+     * back until the composite is destroyed - a lookup on another thread may
+     * still be reading the previous answer, and there is no way to tell when
+     * it has stopped. Placing children once, as reading a mosaic from a file
+     * does, costs one such answer. Moving a child repeatedly - dragging one
+     * around, or animating it - accumulates them, so a caller that does that
+     * over a long session should expect the memory to creep.
      */
     class CompositeData : public ImageData
     {
@@ -44,37 +62,71 @@ namespace rsvp
             int alpha_band = -1;
         };
 
+        /**
+         * @brief Everything a composite works out about where its children
+         * sit, held together so that it can be published in one step.
+         *
+         * A snapshot's contents never change once it is published, which is
+         * what lets a pixel lookup read one without locking while another
+         * thread is working out the next one. SSim samples the terrain from
+         * one thread per core inside its range-image simulation, so lookups
+         * really do run concurrently.
+         */
+        struct GeometrySnapshot
+        {
+            /**
+             * What is known about each child, in the same order as `images`.
+             *
+             * Entries for null children are present but left at their
+             * defaults, so that indices line up with `images`.
+             */
+            std::vector<ChildGeometry> children;
+
+            /// The merged bounds of those children.
+            TerrainBounds bounds;
+
+            /**
+             * The `geometry_version()` this was last known to be good for.
+             *
+             * Not part of what the snapshot says about the children, but a
+             * record of when that was last confirmed, so it can be restamped
+             * on a snapshot lookups are already reading. Atomic because they
+             * are reading it at the time.
+             */
+            mutable std::atomic<unsigned long> version {0};
+        };
+
         std::vector<std::shared_ptr<rsvp::ImageData> > images;
 
         /**
-         * @brief What is known about each child, in the same order as
-         * `images`, recomputed only when an image has moved or been relabelled
-         * since it was last worked out.
+         * @brief The current snapshot, working out a new one first if an image
+         * has moved or been relabelled since the last one was published.
          *
-         * Entries for null children are present but left at their defaults, so
-         * that indices line up with `images`.
+         * Resolve this once per lookup and pass it down rather than calling it
+         * again for each thing it holds. Two calls can land either side of an
+         * invalidation and hand back different snapshots, and a lookup that
+         * blends children located by one snapshot with bounds taken from
+         * another is answering from a mosaic that never existed. Doing it once
+         * also keeps the atomic load off the innermost loops.
          *
-         * Every pixel lookup consults this, so the check that the cache is
-         * still good is kept here to be inlined, and only the refill is a
-         * call.
+         * Every pixel lookup consults this, so the check that the published
+         * snapshot is still good is kept here to be inlined, and only working
+         * out a new one is a call.
          */
-        const std::vector<ChildGeometry> &child_geometry() const
+        const GeometrySnapshot &geometry() const
         {
-            if (cached_geometry_version != geometry_version())
+            const GeometrySnapshot *snapshot =
+                published_geometry.load(std::memory_order_acquire);
+
+            if (snapshot == nullptr ||
+                snapshot->version.load(std::memory_order_relaxed) !=
+                    geometry_version())
             {
-                refresh_geometry_cache();
+                return refresh_geometry_cache();
             }
 
-            return cached_children;
+            return *snapshot;
         }
-
-        /**
-         * @brief The merged bounds of the children.
-         *
-         * Returns a reference because pixel lookups consult this and do not
-         * need a copy.
-         */
-        const TerrainBounds &merged_bounds() const;
 
         /**
          * @brief Cheaply rule out a child being able to supply a clamped
@@ -95,15 +147,54 @@ namespace rsvp
         child_may_reach(const ChildGeometry &info, double x, double y);
 
     private:
-        mutable std::vector<ChildGeometry> cached_children;
-        mutable TerrainBounds cached_bounds;
-        mutable unsigned long cached_geometry_version = 0;
+        /**
+         * @brief The snapshot lookups are currently reading, or null before
+         * the first one has been worked out.
+         *
+         * Only ever made to point at a snapshot `retained_geometry` owns, so a
+         * lookup that has loaded it can keep reading it for as long as this
+         * composite lives.
+         */
+        mutable std::atomic<const GeometrySnapshot *> published_geometry {
+            nullptr};
+
+        /// Serializes working out a new snapshot. Lookups never take this.
+        mutable std::mutex geometry_mutex;
 
         /**
-         * @brief Bring `cached_children` and `cached_bounds` up to date, if an
-         * image has moved or been relabelled since they were filled in.
+         * @brief Keeps every snapshot that has been published alive.
+         *
+         * A lookup holds a bare reference into the current snapshot rather
+         * than a share of it, since taking a share on the hot path would cost
+         * an atomic increment per pixel. Retiring a snapshot therefore cannot
+         * free it, so we hold on to it instead. Nothing is added here for an
+         * invalidation that leaves this composite's own geometry unchanged, so
+         * what accumulates is one small snapshot per real move of a child, not
+         * one per lookup or one per unrelated image's move.
+         *
+         * @see CompositeData for what that costs a caller that moves its
+         * children over and over.
          */
-        void refresh_geometry_cache() const;
+        mutable std::vector<std::shared_ptr<const GeometrySnapshot> >
+            retained_geometry;
+
+        /**
+         * @brief Work out and publish a snapshot for the current version.
+         *
+         * @return The snapshot to read, which is the one just published unless
+         * another thread published an equally current one first.
+         */
+        const GeometrySnapshot &refresh_geometry_cache() const;
+
+        /**
+         * @brief Whether two snapshots say the same thing about the children.
+         *
+         * Compares bit-exactly, since a snapshot that is still good is the
+         * same arithmetic run over the same inputs and reproduces its own
+         * values exactly.
+         */
+        static bool describes_same_geometry(const GeometrySnapshot &first,
+                                            const GeometrySnapshot &second);
 
         /**
          * @brief Work out how far outside its bounds an image can still answer
@@ -209,15 +300,21 @@ namespace rsvp
          * their normal compositing first: inside a tile this returns the same
          * answer, but more expensively.
          *
-         * @param[out] value The reconstructed value.
-         * @param[in] x      The "x-like" coordinate of the pixel of interest
-         * @param[in] y      The "y-like" coordinate of the pixel of interest
-         * @param[in] band   The band of the pixel to access
+         * Where the children sit is taken as an argument rather than resolved
+         * here, so that the fallback answers from the same snapshot the caller
+         * already worked from.
+         *
+         * @param[out] value   The reconstructed value.
+         * @param[in] snapshot Where this composite's children sit
+         * @param[in] x        The "x-like" coordinate of the pixel
+         * @param[in] y        The "y-like" coordinate of the pixel
+         * @param[in] band     The band of the pixel to access
          *
          * @return false if no child is within a pixel of (x, y), which means
          * (x, y) is genuinely outside the composite rather than on a seam.
          */
         bool get_seam_pixel_double(double &value,
+                                   const GeometrySnapshot &snapshot,
                                    double x,
                                    double y,
                                    int band) const;
@@ -232,13 +329,16 @@ namespace rsvp
          * loops that reconstruct a seam, and out-of-terrain lookups are common
          * enough to be worth the check.
          *
-         * @param[in] x The "x-like" coordinate of the pixel of interest
-         * @param[in] y The "y-like" coordinate of the pixel of interest
+         * @param[in] snapshot Where this composite's children sit
+         * @param[in] x        The "x-like" coordinate of the pixel
+         * @param[in] y        The "y-like" coordinate of the pixel
          *
          * @return false if (x, y) cannot be on a seam. true means only that it
          * might be.
          */
-        bool could_be_on_seam(double x, double y) const;
+        bool could_be_on_seam(const GeometrySnapshot &snapshot,
+                              double x,
+                              double y) const;
 
         /**
          * @brief Work out which band of an image carries its alpha value.
