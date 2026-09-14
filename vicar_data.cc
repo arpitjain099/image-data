@@ -468,10 +468,13 @@ namespace rsvp
             result->lblsize +                        // Vicar label
             result->get_record_size() * result->NLB; // Binary header
 
-        int data_length = result->get_n1() *          // Logical lines
-            (result->get_binary_prefix_byte_count() + // Label bytes per line
-             result->get_n2() *                       // Logical samples
-                 result->get_n3() *                   // Logical bands
+        // The image area holds N2*N3 records, each one a binary prefix
+        // followed by N1 pixels (see the diagram in vicar_data.h), so the
+        // prefix is counted once per record rather than once per band.
+        int data_length = result->get_n2() *          // Logical samples
+            result->get_n3() *                        // Logical bands
+            (result->get_binary_prefix_byte_count() + // This record's prefix
+             result->get_n1() *                       // Logical lines
                  result->get_pixel_byte_count());     // Bytes per pixel
 
         // Append any EOL labels
@@ -550,15 +553,17 @@ namespace rsvp
         int perform_swap = (raw_data_is_int && result->int_opposite_endian) ||
             (!raw_data_is_int && result->real_opposite_endian);
 
+        int record_size = result->NBB + // A record's prefix
+            result->N1 * fmt_size;      // and its pixels
+
         for (int n3 = 0; n3 < result->N3; n3++)
         {
-            int n3_offset = n3 * result->NBB + // Prior lines' prefixes
-                n3 * result->N2 * result->N1 * fmt_size + // Prior lines' data
-                result->NBB; // Current line's prefix
+            int n3_offset = n3 * result->N2 * record_size + // Prior records
+                result->NBB; // Current record's prefix
             for (int n2 = 0; n2 < result->N2; n2++)
             {
-                int n2_offset = n3_offset +
-                    n2 * result->N1 * fmt_size; // This line's prior samples
+                int n2_offset =
+                    n3_offset + n2 * record_size; // This band's prior records
                 for (int n1 = 0; n1 < result->N1; n1++)
                 {
                     int offset =
