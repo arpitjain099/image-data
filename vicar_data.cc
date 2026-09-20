@@ -686,9 +686,6 @@ namespace rsvp
 
         const std::unique_ptr<uint8_t[]> slab(new uint8_t[slab_bytes]);
 
-        int record_size = result->NBB + // A record's prefix
-            result->N1 * fmt_size;      // and its pixels
-
         for (int n3 = 0; n3 < result->N3; n3++)
         {
             ht_file.read(reinterpret_cast<char *>(slab.get()),
