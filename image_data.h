@@ -1,13 +1,21 @@
 #ifndef RSVP_IMAGE_DATA_IMAGE_DATA_H
 #define RSVP_IMAGE_DATA_IMAGE_DATA_H
 
-#include <list>
+#include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace rsvp
 {
+
+    /**
+     * @brief The extension of a path, lower-cased and without the dot.
+     *
+     * @return The empty string if the path has no extension.
+     */
+    std::string get_file_extension(const std::string &path);
 
     /**
      * @brief A counter that changes whenever the placement of any image
@@ -40,17 +48,28 @@ namespace rsvp
     void invalidate_geometry();
 
     /**
-     * @brief A struct to represent the spatial bounds of terrain data.
+     * @brief The extent of an image's pixels.
      *
-     * Bounds are specified in world coordinates (meters).
+     * Bounds run over the pixel centers, in the coordinates the image's
+     * lookups take: pixel indices for a bare image, world coordinates
+     * (meters) for a terrain placed by a transform.
      */
     struct TerrainBounds
     {
         bool valid = false;     ///< Whether the bounds are valid
-        double min_x = 0.0;     ///< Minimum X coordinate (meters)
-        double max_x = 0.0;     ///< Maximum X coordinate (meters)
-        double min_y = 0.0;     ///< Minimum Y coordinate (meters)
-        double max_y = 0.0;     ///< Maximum Y coordinate (meters)
+        double min_x = 0.0;     ///< Minimum X coordinate
+        double max_x = 0.0;     ///< Maximum X coordinate
+        double min_y = 0.0;     ///< Minimum Y coordinate
+        double max_y = 0.0;     ///< Maximum Y coordinate
+
+        /**
+         * How far outside the bounds a lookup can still land on a pixel: one
+         * pixel's pitch, in the same coordinates as the bounds. A lookup
+         * further out than this along either axis finds nothing.
+         *
+         * Zero means unknown, and rules nothing out.
+         */
+        double pixel_reach = 0.0;
 
         /**
          * @brief Check if the bounds are valid.
@@ -99,7 +118,31 @@ namespace rsvp
         }
 
         /**
+         * @brief Check whether a lookup at (x, y) could land on a pixel.
+         *
+         * This is the test a composite skips a child by, so it errs toward
+         * yes: a point is only ruled out when the bounds and the reach are
+         * both known and it lies beyond them.
+         *
+         * @param[in] x      The "x-like" coordinate to test
+         * @param[in] y      The "y-like" coordinate to test
+         * @param[in] margin Slack beyond the reach, as for `contains`
+         *
+         * @return false if a lookup at (x, y) certainly finds nothing. true
+         * means only that it might.
+         */
+        bool could_reach(double x, double y, double margin = 0.0) const
+        {
+            return !valid || pixel_reach <= 0.0 ||
+                contains(x, y, pixel_reach + margin);
+        }
+
+        /**
          * @brief Union this bounds with another bounds.
+         *
+         * A point within either's reach of the union is within the larger of
+         * the two reaches of it, and a reach that is unknown on either side
+         * stays unknown.
          */
         void merge(const TerrainBounds &other)
         {
@@ -118,6 +161,10 @@ namespace rsvp
             max_x = std::max(max_x, other.max_x);
             min_y = std::min(min_y, other.min_y);
             max_y = std::max(max_y, other.max_y);
+
+            pixel_reach = (pixel_reach > 0.0 && other.pixel_reach > 0.0)
+                ? std::max(pixel_reach, other.pixel_reach)
+                : 0.0;
         }
     };
 
@@ -138,6 +185,153 @@ namespace rsvp
 
     protected:
         ImageData();
+
+        /**
+         * @brief The four pixels a bilinear sample at (x, y) draws on, and
+         * the weight each is owed.
+         *
+         * The corners are (x0, y0), (x1, y0), (x0, y1) and (x1, y1), with the
+         * weights in that order. A corner whose weight is zero is collapsed
+         * onto its neighbour, so the four are always inside the image
+         * whenever (x, y) is.
+         */
+        struct BilinearCorners
+        {
+            int x0;
+            int y0;
+            int x1;
+            int y1;
+            double weight_ul;
+            double weight_ur;
+            double weight_ll;
+            double weight_lr;
+        };
+
+        /**
+         * @brief Work out the corners and weights of a bilinear sample.
+         *
+         * Shared by the default `get_interpolated_pixel_double` and by images
+         * that can read the corners straight out of memory.
+         */
+        static BilinearCorners bilinear_corners(double x, double y)
+        {
+            // Converting a double to an int is undefined unless the value
+            // fits, and a target that saturates lands the far corner at
+            // INT_MAX + 1, which wraps to the near side of every bounds
+            // check. A coordinate that far out - or a NaN, which fails every
+            // comparison - cannot be in any image, so send it to a corner
+            // that is certainly outside one instead of casting it.
+            //
+            // The limits leave room for the +1 on the far corner and the
+            // decrement on the near one.
+            if (!(x > -2147483647.0 && x < 2147483646.0))
+            {
+                x = -1.0;
+            }
+
+            if (!(y > -2147483647.0 && y < 2147483646.0))
+            {
+                y = -1.0;
+            }
+
+            // We sample at (x0, y0) and (x0 + 1, y0 + 1), so those two must
+            // span the input, which means rounding down rather than toward
+            // zero. Getting that wrong for coordinates in (-1, 0) - leaving
+            // the corner at 0 - is what used to mirror the interpolation
+            // about the image edge instead of reporting the coordinate out of
+            // bounds.
+            //
+            // Done by hand rather than with std::floor: this is the terrain
+            // settling hot path, and on 32-bit x86 without SSE4.1 there is no
+            // instruction to inline std::floor to, so it compiles to a libm
+            // call.
+            int x0 = static_cast<int>(x);
+            int y0 = static_cast<int>(y);
+
+            if (x < x0)
+            {
+                x0--;
+            }
+
+            if (y < y0)
+            {
+                y0--;
+            }
+
+            const double frac_x = x - x0;
+            const double frac_y = y - y0;
+
+            // When a fraction is zero the far corner has zero weight, so it
+            // must not be required to exist - otherwise a coordinate landing
+            // exactly on the last row or column of an image would fail for
+            // want of a neighbor it does not need. Fold that in by collapsing
+            // the far corner onto the near one, which keeps the four fetches
+            // unconditional.
+            //
+            // Two cheaper-looking alternatives measure worse, so leave this
+            // alone: branching on the fractions costs a pair of unpredictable
+            // branches per call (and comparing a double against zero costs
+            // two branches, not one), and letting a weightless fetch fail
+            // instead stops the compiler short-circuiting the weight test.
+            BilinearCorners corners;
+            corners.x0 = x0;
+            corners.y0 = y0;
+            corners.x1 = (frac_x > 0.0) ? x0 + 1 : x0;
+            corners.y1 = (frac_y > 0.0) ? y0 + 1 : y0;
+            corners.weight_ul = (1.0 - frac_x) * (1.0 - frac_y);
+            corners.weight_ur = frac_x * (1.0 - frac_y);
+            corners.weight_ll = (1.0 - frac_x) * frac_y;
+            corners.weight_lr = frac_x * frac_y;
+            return corners;
+        }
+
+        /**
+         * @brief Round to the nearest integer, halves away from zero.
+         *
+         * Used both to snap a coordinate to a whole pixel for uninterpolated
+         * lookups and to round a value for the integer accessors.
+         *
+         * A value that does not fit in an int saturates - and a NaN, which
+         * fails every comparison, comes out as INT_MIN - since converting it
+         * would be undefined. As a coordinate, either end is outside every
+         * image.
+         */
+        static int round_to_int(double value)
+        {
+            if (value > 0.0)
+            {
+                return value < 2147483647.0 ? static_cast<int>(value + 0.5) :
+                                              2147483647;
+            }
+
+            return value > -2147483648.0 ? static_cast<int>(value - 0.5) :
+                                           (-2147483647 - 1);
+        }
+
+
+        /**
+         * @brief The bounds of this image's own pixel grid, in pixel indices.
+         *
+         * For an image that holds a grid of pixels to return from
+         * `get_bounds`: the pixel centers, reaching one pixel past them.
+         *
+         * @return Invalid bounds if the grid is empty.
+         */
+        TerrainBounds pixel_grid_bounds() const
+        {
+            TerrainBounds bounds;
+
+            if (get_width() < 1 || get_height() < 1)
+            {
+                return bounds;
+            }
+
+            bounds.valid = true;
+            bounds.max_x = get_width() - 1;
+            bounds.max_y = get_height() - 1;
+            bounds.pixel_reach = 1.0;
+            return bounds;
+        }
 
     public:
         /**
@@ -169,6 +363,11 @@ namespace rsvp
 
         /**
          * @brief Set the image band associated with the alpha blending value.
+         *
+         * A composite caches which band of each child it blends by, and only
+         * learns that this has changed through `invalidate_geometry`, which
+         * this calls. An override must therefore call this as well as
+         * whatever else it does.
          *
          * @param[in] band The alpha image band
          */
@@ -255,6 +454,33 @@ namespace rsvp
             double &value, double &weight, double x, double y, int band) const;
 
         /**
+         * @brief Get the interpolated values of several bands at one point.
+         *
+         * A composite wants a child's data and its alpha at the same point,
+         * and asking for them a band at a time repeats the walk down the
+         * child's chain of wrappers - the inverse transform, the offset, the
+         * search for the corners - once per band. This makes the walk once:
+         * a wrapper transforms the point and hands the whole request down,
+         * and an image reads every band from the same corners.
+         *
+         * The default asks for the bands one at a time.
+         *
+         * @param[out] values The interpolated value of each of `bands`, in
+         * the same order. Unspecified when this returns false.
+         * @param[in]  bands  The bands to sample
+         * @param[in]  count  How many bands there are
+         * @param[in]  x      The "x-like" coordinate of the pixel of interest
+         * @param[in]  y      The "y-like" coordinate of the pixel of interest
+         *
+         * @return true if (x, y) was within bounds and every band was valid
+         */
+        virtual bool get_interpolated_bands_double(double *values,
+                                                   const int *bands,
+                                                   int count,
+                                                   double x,
+                                                   double y) const;
+
+        /**
          * @brief Get the uninterpolated pixel band value as an integer.
          *
          * The indexing standard used throughout these classes is (x, y)
@@ -315,15 +541,24 @@ namespace rsvp
         }
 
         /**
-         * @brief Get the spatial bounds of this terrain data in world
-         * coordinates.
+         * @brief Where this image's pixels are, in the coordinates its
+         * lookups take.
          *
-         * This method queries the underlying image data format (e.g., VICAR
-         * labels) to determine the real-world extent of the data. For composite
-         * images, this returns the union of all constituent image bounds.
+         * Bounds run over the pixel centers. For a bare image they are pixel
+         * indices; for a terrain placed by a transform they are world
+         * coordinates, in meters; for a composite they are the union of its
+         * children's. Whichever it is, they are in the coordinates a lookup on
+         * this image takes, which is what lets a composite skip a child by
+         * them. Where a VICAR file's labels say it sits in the world is a
+         * different question, answered by `VicarData::get_map_bounds`.
          *
-         * @return TerrainBounds struct containing the spatial extent in meters,
-         * or an invalid bounds if the data does not have spatial information.
+         * @return Invalid bounds unless overridden. An image holding a pixel
+         * grid of its own reports it with `pixel_grid_bounds`. The default is
+         * left invalid rather than derived from `get_width` and `get_height`
+         * because a wrapper that forwards those without overriding this would
+         * then report its stored image's grid in a frame its own lookups do
+         * not take, and a composite would skip it by bounds that are not where
+         * its pixels are. An image with invalid bounds is never skipped.
          */
         virtual TerrainBounds get_bounds() const
         {

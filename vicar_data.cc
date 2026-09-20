@@ -4,19 +4,19 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
-#include <iostream>
+#include <limits>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <unistd.h>
+#include <type_traits>
 #include <utility>
+#include <vector>
 
 static bool extract_vector(const std::string &array_str, double values[3])
 {
@@ -30,33 +30,183 @@ static bool extract_vector(const std::string &array_str, double values[3])
 namespace rsvp
 {
 
-    VicarData::VicarData() :
-        NL(0),
-        NS(0),
-        NB(0),
-        pds_bytes(0),
-        lblsize(0),
-        NBB(0),
-        NLB(0),
-        pixel_data(nullptr),
-        int_opposite_endian(false),
-        real_opposite_endian(false)
+    namespace
     {
+        // Decodes `count` pixels of one raw type into doubles, `stride`
+        // doubles apart. Chosen once per file rather than switching on the
+        // format and byte order for every pixel.
+        using Decoder = void (*)(const uint8_t *source,
+                                 double *destination,
+                                 int count,
+                                 size_t stride);
+
+        template <typename T, bool swap>
+        void decode_run(const uint8_t *source,
+                        double *destination,
+                        const int count,
+                        const size_t stride)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                // Swapping the raw bytes and then copying them into a T keeps
+                // this free of type punning, which matters now that it is
+                // inlined into the innermost loop.
+                unsigned char bytes[sizeof(T)];
+                if constexpr (swap)
+                {
+                    byte_swap(bytes, source, sizeof(T));
+                }
+                else
+                {
+                    memcpy(bytes, source, sizeof(T));
+                }
+
+                T raw;
+                memcpy(&raw, bytes, sizeof(T));
+                *destination = static_cast<double>(raw);
+
+                source += sizeof(T);
+                destination += stride;
+            }
+        }
+
+        template <typename T>
+        Decoder decoder(const bool swap)
+        {
+            return swap ? &decode_run<T, true> : &decode_run<T, false>;
+        }
+
+        // The decoder for a format, or null if the format cannot be decoded.
+        // VICAR's BYTE is unsigned; the other integer formats are signed.
+        Decoder decoder_for(const VicarData::DataFormat format,
+                            const bool swap)
+        {
+            switch (format)
+            {
+            case VicarData::BYTE:
+                return decoder<uint8_t>(false);
+            case VicarData::HALF:
+                return decoder<int16_t>(swap);
+            case VicarData::FULL:
+                return decoder<int32_t>(swap);
+            case VicarData::REAL:
+                return decoder<float>(swap);
+            case VicarData::DOUB:
+                return decoder<double>(swap);
+            case VicarData::COMP:
+                break;
+            }
+
+            return nullptr;
+        }
+
+        // Encodes `count` doubles into one raw type, in the host byte order.
+        // The raw types mirror the decoder's. Converting a double to an
+        // integer type it does not fit is undefined, and comes out differently
+        // on x86-64 and arm64, so integer types saturate first: NaN to zero,
+        // everything else to the nearest end of the type's range.
+        using Encoder =
+            void (*)(const double *source, uint8_t *destination, int count);
+
+        template <typename T>
+        T to_raw(const double value)
+        {
+            if constexpr (std::is_integral<T>::value)
+            {
+                if (std::isnan(value))
+                {
+                    return 0;
+                }
+
+                return static_cast<T>(std::clamp(
+                    value,
+                    static_cast<double>(std::numeric_limits<T>::lowest()),
+                    static_cast<double>(std::numeric_limits<T>::max())));
+            }
+            else
+            {
+                return static_cast<T>(value);
+            }
+        }
+
+        template <typename T>
+        void encode_run(const double *source,
+                        uint8_t *destination,
+                        const int count)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                const T raw = to_raw<T>(source[i]);
+                memcpy(destination, &raw, sizeof(T));
+                destination += sizeof(T);
+            }
+        }
+
+        Encoder encoder_for(const VicarData::DataFormat format)
+        {
+            switch (format)
+            {
+            case VicarData::BYTE:
+                return &encode_run<uint8_t>;
+            case VicarData::HALF:
+                return &encode_run<int16_t>;
+            case VicarData::FULL:
+                return &encode_run<int32_t>;
+            case VicarData::REAL:
+                return &encode_run<float>;
+            case VicarData::DOUB:
+                return &encode_run<double>;
+            case VicarData::COMP:
+                break;
+            }
+
+            return nullptr;
+        }
+
+        // Read `count` bytes from `file` onto the end of `text`
+        void append_from_file(std::string &text,
+                              std::ifstream &file,
+                              const size_t count)
+        {
+            const size_t old_size = text.size();
+            text.resize(old_size + count, '\0');
+            file.read(&text[old_size], static_cast<std::streamsize>(count));
+        }
+
+        // The system labels write_vicarfile works out for itself. set_labels
+        // never keeps one of these as an unassociated label, so the writer
+        // cannot repeat one from the labels read in: a repeated label
+        // overrides the one written, and a repeated `EOL=1` sends the reader
+        // looking for end-of-line labels that were never written.
+        //
+        // Every `TAG=` the writer emits ahead of the unassociated labels must
+        // be here, and vice versa.
+        const std::array<std::string_view, 24> system_labels {
+            "LBLSIZE", "FORMAT",  "TYPE",  "BUFSIZ",  "DIM",      "EOL",
+            "RECSIZE", "ORG",     "NL",    "NS",      "NB",       "N1",
+            "N2",      "N3",      "N4",    "NBB",     "NLB",      "HOST",
+            "INTFMT",  "REALFMT", "BHOST", "BINTFMT", "BREALFMT", "BLTYPE"};
+
+        bool is_system_label(const std::string &tag)
+        {
+            return std::find(system_labels.begin(),
+                             system_labels.end(),
+                             tag) != system_labels.end();
+        }
     }
 
+    VicarData::VicarData() = default;
 
     VicarData::VicarData(int samples,
                          int lines,
                          int bands,
                          DataFormat data_format) :
-        VicarData()
+        NL(lines),
+        NS(samples),
+        NB(bands),
+        pixel_data(new double[static_cast<size_t>(bands) * lines * samples]),
+        format(data_format)
     {
-        this->NS = samples;
-        this->NL = lines;
-        this->NB = bands;
-        this->format = data_format;
-        this->pixel_data = std::unique_ptr<double[]>(
-            new double[static_cast<unsigned long>(NB * NL * NS)]);
     }
 
     void VicarData::set_labels(std::string _comments)
@@ -262,16 +412,11 @@ namespace rsvp
                 {
                     NLB = std::stoi(value);
                 }
-                else
+                else if (!is_system_label(tag))
                 {
-                    std::array<std::string_view, 6> remaining_labels {
-                        "N1", "N2", "N3", "DIM", "TYPE", "BUFSIZ"};
-                    if (std::find(remaining_labels.begin(),
-                                  remaining_labels.end(),
-                                  tag) == remaining_labels.end())
-                    {
-                        unassociated_labels[tag] = value;
-                    }
+                    // Anything the writer does not work out for itself is
+                    // kept, to be written back as it was read
+                    unassociated_labels[tag] = value;
                 }
             }
         }
@@ -336,8 +481,7 @@ namespace rsvp
             return false;
         }
 
-        pixel_data[static_cast<size_t>(band * (NL * NS) + line * NS +
-                                       sample)] = value;
+        pixel_data[pixel_index(sample, line, band)] = value;
         return true;
     }
 
@@ -433,51 +577,48 @@ namespace rsvp
         std::string label_size_string = label_tag.substr(8, std::string::npos);
         const long label_size = std::stol(label_size_string);
 
-        // Initialize an empty string large enough to hold the labels
-        std::string comments(static_cast<size_t>(label_size), '\0');
-        comments.clear();
-
         // Reset the stream back to the beginning of the vicar labels for
-        // ease of ingestion and read it into the string
+        // ease of ingestion and read it into a string
         ht_file.clear();
         ht_file.seekg(pds_label_bytes, std::ios::beg);
 
-        for (int i = 0; i < label_size; i++)
-        {
-            comments.push_back(static_cast<char>(ht_file.get()));
-        }
+        std::string comments;
+        append_from_file(comments, ht_file, static_cast<size_t>(label_size));
 
         // Strip off all of the trailing null bytes - they interfere with
         // the EOL label parsing
-        comments = comments.substr(0, comments.find_first_of('\0'));
+        comments.resize(std::min(comments.find('\0'), comments.size()));
 
         // Create a VicarData to be returned and have it parse its own
         // comments
         std::shared_ptr<VicarData> result(new VicarData());
-        result->filepath = path;
         result->set_labels(comments);
 
-        result->pds_bytes = pds_label_bytes;
-
         // The data actually begins after both of the PDS and vicar labels
-        // and any binary label lines, but mmap can only map data on
-        // page-size boundaries (and pages are typically larger than
-        // LBLSIZE). We make sure to get the labels, the binary labels, and
-        // all of the data.
-        int map_offset = result->pds_bytes +         // PDS label
-            result->lblsize +                        // Vicar label
-            result->get_record_size() * result->NLB; // Binary header
+        // and any binary label lines.
+        const std::streamoff data_offset = pds_label_bytes + // PDS label
+            result->lblsize +                                // Vicar label
+            static_cast<std::streamoff>(result->get_record_size()) *
+                result->NLB; // Binary header
 
-        int data_length = result->get_n1() *          // Logical lines
-            (result->get_binary_prefix_byte_count() + // Label bytes per line
-             result->get_n2() *                       // Logical samples
-                 result->get_n3() *                   // Logical bands
-                 result->get_pixel_byte_count());     // Bytes per pixel
+        // The image area is N2 * N3 records, each a binary prefix of NBB
+        // bytes followed by N1 pixels
+        const size_t run_bytes = static_cast<size_t>(result->get_n1()) *
+            result->get_pixel_byte_count();
+        const size_t record_bytes =
+            static_cast<size_t>(result->get_binary_prefix_byte_count()) +
+            run_bytes;
+        const size_t slab_bytes =
+            static_cast<size_t>(result->get_n2()) * record_bytes;
+        const size_t data_length =
+            static_cast<size_t>(result->get_n3()) * slab_bytes;
 
         // Append any EOL labels
         if (comments.find("EOL=1") != std::string::npos)
         {
-            ht_file.seekg(map_offset + data_length, std::ios::beg);
+            ht_file.seekg(
+                data_offset + static_cast<std::streamoff>(data_length),
+                std::ios::beg);
 
             // Read everything until the first space
             std::string eol_lblsize;
@@ -504,143 +645,82 @@ namespace rsvp
             // well as the space delimiter
             eol_label_size -= eol_lblsize.size() + 1;
 
-            // Append the EOL labels to the comments
-            comments.reserve(comments.size() + eol_label_size);
-
-            for (unsigned int i = 0; i < eol_label_size; i++)
-            {
-                comments.push_back(static_cast<char>(ht_file.get()));
-            }
-
-            // Parse the comments again
+            // Append the EOL labels to the comments and parse them again
+            append_from_file(comments, ht_file, eol_label_size);
             result->set_labels(comments);
         }
 
-        // Read the pixel data
-        ht_file.seekg(map_offset, std::ios::beg);
+        const bool raw_data_is_int = result->format == BYTE ||
+            result->format == HALF || result->format == FULL;
 
-        auto data_array = std::unique_ptr<uint8_t[]>(
-            new uint8_t[static_cast<size_t>(data_length)]);
-        ht_file.read(reinterpret_cast<char *>(data_array.get()), data_length);
-
-        // We're done with reading the file directly
-        ht_file.close();
-
-        // Process the pixel data in the data_array into the pixel array
-        // BSQ  n1 = sample
-        //      n2 = line
-        //      n3 = band
-        // BIL  n1 = sample
-        //      n2 = band
-        //      n3 = line
-        // BIP  n1 = band
-        //      n2 = sample
-        //      n3 = line
-
-        int fmt_size = result->get_pixel_byte_count();
-        result->pixel_data =
-            std::unique_ptr<double[]>(new double[static_cast<size_t>(
-                result->NB * result->NL * result->NS)]);
-
-        int raw_data_is_int =
-            (result->format == BYTE || result->format == HALF ||
-             result->format == WORD || result->format == FULL ||
-             result->format == LONG);
-
-        int perform_swap = (raw_data_is_int && result->int_opposite_endian) ||
+        const bool perform_swap =
+            (raw_data_is_int && result->int_opposite_endian) ||
             (!raw_data_is_int && result->real_opposite_endian);
+
+        const Decoder decode = decoder_for(result->format, perform_swap);
+        if (decode == nullptr)
+        {
+            throw std::runtime_error(path + ": Unhandled format type" +
+                                     std::to_string(result->format));
+        }
+
+        // Read the pixel data
+        ht_file.seekg(data_offset, std::ios::beg);
+
+        // Decode the raw pixels into the pixel array, which is always BSQ,
+        // a slab of N2 records at a time: a band of a BSQ file, a line of a
+        // BIL or BIP one. Each run of N1 raw pixels is contiguous in the
+        // file; where it lands in the pixel array depends on the
+        // organization:
+        //
+        // BSQ  n1 = sample     n2 = line       n3 = band
+        // BIL  n1 = sample     n2 = band       n3 = line
+        // BIP  n1 = band       n2 = sample     n3 = line
+        //
+        // The slab buffer is left uninitialized, since the read fills all of
+        // it or the file is rejected.
+        const size_t plane = static_cast<size_t>(result->NL) * result->NS;
+
+        result->pixel_data = std::unique_ptr<double[]>(
+            new double[plane * static_cast<size_t>(result->NB)]);
+
+        const std::unique_ptr<uint8_t[]> slab(new uint8_t[slab_bytes]);
 
         for (int n3 = 0; n3 < result->N3; n3++)
         {
-            int n3_offset = n3 * result->NBB + // Prior lines' prefixes
-                n3 * result->N2 * result->N1 * fmt_size + // Prior lines' data
-                result->NBB; // Current line's prefix
+            ht_file.read(reinterpret_cast<char *>(slab.get()),
+                         static_cast<std::streamsize>(slab_bytes));
+
+            if (static_cast<size_t>(ht_file.gcount()) != slab_bytes)
+            {
+                throw std::runtime_error(
+                    path + ": File ends before its pixel data does");
+            }
+
             for (int n2 = 0; n2 < result->N2; n2++)
             {
-                int n2_offset = n3_offset +
-                    n2 * result->N1 * fmt_size; // This line's prior samples
-                for (int n1 = 0; n1 < result->N1; n1++)
+                // This record's pixels, after its binary prefix
+                const uint8_t *source = slab.get() +
+                    static_cast<size_t>(n2) * record_bytes + result->NBB;
+
+                double *destination = result->pixel_data.get();
+                size_t stride = 1;
+
+                switch (result->org)
                 {
-                    int offset =
-                        n2_offset + n1 * fmt_size; // This sample's prior bytes
-
-                    const unsigned char *p =
-                        &data_array[static_cast<size_t>(offset)];
-                    union
-                    {
-                        char i8;
-                        short i16;
-                        int i32;
-                        float f32;
-                        double f64;
-                        unsigned char buffer[8];
-                    } integer_union {};
-
-                    double value;
-                    if (perform_swap)
-                    {
-                        rsvp::byte_swap(integer_union.buffer, p, fmt_size);
-                    }
-                    else
-                    {
-                        memcpy(
-                            &integer_union, p, static_cast<size_t>(fmt_size));
-                    }
-
-                    // Cast type to double
-                    switch (result->format)
-                    {
-                    case BYTE:
-                        value = static_cast<double>(integer_union.i8);
-                        break;
-                    case HALF:
-                        value = static_cast<double>(integer_union.i16);
-                        break;
-                    case FULL:
-                        value = static_cast<double>(integer_union.i32);
-                        break;
-                    case REAL:
-                        value = static_cast<double>(integer_union.f32);
-                        break;
-                    case DOUB:
-                        value = integer_union.f64;
-                        break;
-                    default:
-                        throw std::runtime_error(
-                            path + ": Unhandled format type" +
-                            std::to_string(result->format));
-                    }
-
-                    switch (result->org)
-                    {
-                    case BSQ:
-                        // No reshuffling needed
-                        // This is fastest
-                        // n3 = band
-                        // n2 = line
-                        // n1 = sample
-                        result->pixel_data[static_cast<size_t>(
-                            n3 * (result->NL * result->NS) + n2 * result->NS +
-                            n1)] = value;
-                        break;
-                    case BIL:
-                        // n2 = band
-                        // n3 = line
-                        // n1 = sample
-                        result->pixel_data[static_cast<size_t>(
-                            n2 * (result->NL * result->NS) + n3 * result->NS +
-                            n1)] = value;
-                        break;
-                    case BIP:
-                        // n1 = band
-                        // n3 = line
-                        // n2 = sample
-                        result->pixel_data[static_cast<size_t>(
-                            n1 * (result->NL * result->NS) + n3 * result->NS +
-                            n2)] = value;
-                        break;
-                    }
+                case BSQ:
+                    destination += result->pixel_index(0, n2, n3);
+                    break;
+                case BIL:
+                    destination += result->pixel_index(0, n3, n2);
+                    break;
+                case BIP:
+                    destination += result->pixel_index(n2, n3, 0);
+                    stride = plane;
+                    break;
                 }
+
+                decode(source, destination, result->N1, stride);
             }
         }
 
@@ -649,12 +729,64 @@ namespace rsvp
 
     bool is_number(const std::string &n)
     {
-        std::regex number_regex(R"([+-]?\d+(?:\.\d*)?)");
+        static const std::regex number_regex(R"([+-]?\d+(?:\.\d*)?)");
         return std::regex_match(n, number_regex);
+    }
+
+    namespace
+    {
+        // Whether set_labels would read `value` back as a parenthesized list:
+        // it takes everything up to the first ')' as the list, so a value
+        // with a ')' anywhere but at the end is not one, whatever it starts
+        // with
+        bool is_list(const std::string &value)
+        {
+            return value.size() >= 2 && value.front() == '(' &&
+                value.back() == ')' &&
+                value.find(')') == value.size() - 1;
+        }
+
+        // Write one label the way set_labels reads it back: numbers and
+        // parenthesized lists bare, anything else quoted, with a quote inside
+        // a string doubled up. A quoted string and a bare list are stored the
+        // same way, so a string that merely starts with '(' has to be told
+        // apart by whether it would survive being read back bare.
+        void write_label(std::ostream &labels,
+                         const std::string &tag,
+                         const std::string &value)
+        {
+            labels << tag << '=';
+
+            if (is_number(value) || is_list(value))
+            {
+                labels << value;
+            }
+            else
+            {
+                labels << '\'';
+                for (const char c : value)
+                {
+                    if (c == '\'')
+                    {
+                        labels << '\'';
+                    }
+                    labels << c;
+                }
+                labels << '\'';
+            }
+
+            labels << ' ';
+        }
     }
 
     void VicarData::write_vicarfile(const std::string &path) const
     {
+        const Encoder encode = encoder_for(format);
+        if (encode == nullptr)
+        {
+            throw std::runtime_error {"Unable to handle complex values!"};
+        }
+
         std::stringstream labels;
         // system labels
         // LBLSIZE is calculated after the result
@@ -723,16 +855,7 @@ namespace rsvp
 
         for (const auto &label : unassociated_labels)
         {
-            labels << label.first << "=";
-            if (is_number(label.second))
-            {
-                labels << label.second;
-            }
-            else
-            {
-                labels << "'" << label.second << "'";
-            }
-            labels << " ";
+            write_label(labels, label.first, label.second);
         }
 
         for (const auto &group : label_values)
@@ -740,16 +863,7 @@ namespace rsvp
             labels << "PROPERTY='" << group.first << "' ";
             for (const auto &label : group.second)
             {
-                labels << label.first << "=";
-                if (is_number(label.second))
-                {
-                    labels << label.second;
-                }
-                else
-                {
-                    labels << "'" << label.second << "'";
-                }
-                labels << " ";
+                write_label(labels, label.first, label.second);
             }
         }
 
@@ -765,51 +879,16 @@ namespace rsvp
         std::ofstream outfile(path, std::ofstream::binary);
         outfile << labels_str;
 
-        for (int b = 0; b < get_bands(); ++b)
+        // Encode a line at a time rather than a pixel at a time
+        std::vector<uint8_t> line(static_cast<size_t>(rec_size));
+
+        for (int b = 0; b < NB; ++b)
         {
-            for (int y = 0; y < get_height(); ++y)
+            for (int y = 0; y < NL; ++y)
             {
-                for (int x = 0; x < get_width(); ++x)
-                {
-                    double value;
-                    get_pixel_double(value, x, y, b);
-
-                    union
-                    {
-                        unsigned char u8;
-                        unsigned short u16;
-                        unsigned int u32;
-                        float f32;
-                        double f64;
-                        unsigned char buffer[8];
-                    } integer_union {};
-
-                    switch (format)
-                    {
-                    case BYTE:
-                        integer_union.u8 = static_cast<uint8_t>(value);
-                        break;
-                    case HALF:
-                        integer_union.u16 = static_cast<uint16_t>(value);
-                        break;
-                    case FULL:
-                        integer_union.u32 = static_cast<uint32_t>(value);
-                        break;
-                    case REAL:
-                        integer_union.f32 = static_cast<float>(value);
-                        break;
-                    case DOUB:
-                        integer_union.f64 = value;
-                        break;
-                    default:
-                        throw std::runtime_error {
-                            "Unable to handle complex values!"};
-                    }
-
-                    outfile.write(
-                        reinterpret_cast<const char *>(integer_union.buffer),
-                        get_pixel_byte_count());
-                }
+                encode(&pixel_data[pixel_index(0, y, b)], line.data(), NS);
+                outfile.write(reinterpret_cast<const char *>(line.data()),
+                              static_cast<std::streamsize>(line.size()));
             }
         }
     }
@@ -953,7 +1032,7 @@ namespace rsvp
             extract_vector(raw_value, camera_e);
     }
 
-    TerrainBounds VicarData::get_bounds() const
+    TerrainBounds VicarData::get_map_bounds() const
     {
         TerrainBounds bounds;
 

@@ -36,29 +36,30 @@ namespace rsvp
          * @brief What a composite needs to know about one of its children but
          * cannot afford to ask for once per pixel.
          *
-         * Asking a child where it is means parsing its labels, and asking
-         * which band holds its alpha walks the chain of wrappers around it.
-         * Both answers hold until an image moves or is relabelled.
+         * Asking a child where it is walks the chain of wrappers around it,
+         * transforming corners on the way back up, and asking which band
+         * holds its alpha walks it again. Both answers hold until an image
+         * moves or is relabelled.
          */
         struct ChildGeometry
         {
-            /// Where the child sits, in this composite's coordinates.
-            TerrainBounds bounds;
-
             /**
-             * How far outside `bounds` the child can still answer a clamped
-             * sample: one of its pixels, measured in this composite's units.
-             *
-             * Zero means "unknown" - the child has no pixel grid of its own to
-             * measure a pixel against - and suppresses culling rather than
-             * risking a cull of a child that would have answered.
+             * Where the child's pixels are, in this composite's coordinates,
+             * and how far past them a lookup on the child still lands on one.
+             * Invalid for a child that does not know, and then the child is
+             * never skipped.
              */
-            double clamp_reach = 0.0;
+            TerrainBounds bounds;
 
             /// How many bands the child has.
             int bands = 0;
 
-            /// Which of those bands carries alpha, or -1 for none.
+            /**
+             * Which of those bands carries alpha, or -1 for none: what
+             * alpha blending resolves the child's own declaration to. Good
+             * for as long as the child reaches `ImageData::set_alpha_band`
+             * whenever its declaration changes.
+             */
             int alpha_band = -1;
         };
 
@@ -84,6 +85,13 @@ namespace rsvp
 
             /// The merged bounds of those children.
             TerrainBounds bounds;
+
+            /**
+             * Whether every child has valid bounds, so that `bounds` is where
+             * every pixel this composite can answer for is. False with no
+             * children.
+             */
+            bool all_bounded = true;
 
             /**
              * The `geometry_version()` this was last known to be good for.
@@ -139,6 +147,8 @@ namespace rsvp
          * @param[in] info The child to test
          * @param[in] x    The "x-like" coordinate of the pixel of interest
          * @param[in] y    The "y-like" coordinate of the pixel of interest
+         *
+         * A child whose bounds or reach are unknown is never ruled out.
          *
          * @return false if the child is certainly too far from (x, y) to have
          * a say. true means only that it might.
@@ -196,15 +206,6 @@ namespace rsvp
         static bool describes_same_geometry(const GeometrySnapshot &first,
                                             const GeometrySnapshot &second);
 
-        /**
-         * @brief Work out how far outside its bounds an image can still answer
-         * a clamped sample.
-         *
-         * @see ChildGeometry::clamp_reach
-         */
-        static double get_clamp_reach_of(const ImageData &image,
-                                         const TerrainBounds &bounds);
-
     public:
         /**
          * @brief Construct a new empty CompositeData.
@@ -259,6 +260,10 @@ namespace rsvp
         /**
          * @brief Get the union of bounds from all images in the composite.
          *
+         * The reach is the largest of the children's, or unknown if any
+         * child's is, or if any child has no bounds at all: a parent
+         * composite could otherwise skip this one where that child answers.
+         *
          * @return The combined terrain bounds.
          */
         TerrainBounds get_bounds() const override;
@@ -283,6 +288,36 @@ namespace rsvp
                                       int band) const override;
 
     protected:
+        /**
+         * @brief Sample one child's data and alpha for compositing.
+         *
+         * A child that is certainly out of reach of (x, y) is skipped without
+         * being sampled. A one-band child - a PGM - is read from band 0
+         * whatever band was asked for, and called fully opaque, as is a
+         * child with no alpha band.
+         *
+         * @param[in]  snapshot Where this composite's children sit
+         * @param[in]  index    Which child to sample
+         * @param[in]  x        The "x-like" coordinate of the pixel
+         * @param[in]  y        The "y-like" coordinate of the pixel
+         * @param[in]  band     The band of the pixel to access
+         * @param[out] value    The child's data at (x, y)
+         * @param[out] alpha    The child's alpha at (x, y), on the image's
+         * 1-255 scale
+         *
+         * @return false if the child does not cover (x, y)
+         *
+         * @throws std::runtime_error if the child has data at (x, y) but not
+         * the alpha band it declares
+         */
+        bool sample_child(const GeometrySnapshot &snapshot,
+                          size_t index,
+                          double x,
+                          double y,
+                          int band,
+                          double &value,
+                          double &alpha) const;
+
         /**
          * @brief Reconstruct a value in the band between abutting images.
          *

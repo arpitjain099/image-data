@@ -2,6 +2,7 @@
 #include <platform.h>
 #include <translated_data.h>
 #include <vicar_data.h>
+#include <z_offset_data.h>
 
 #include <img_data_gtest/gtest.h>
 #include <test_utils/test_utils.h>
@@ -23,7 +24,6 @@ private:
     int width = 3;
     int height = 3;
     int band_count = 1;
-    int alpha_value = -1;
     bool use_interpolation = true;
 
 public:
@@ -154,16 +154,6 @@ public:
     int get_height() const override
     {
         return height;
-    }
-
-    int get_alpha_band() const override
-    {
-        return alpha_value;
-    }
-
-    void set_alpha_band(int band) override
-    {
-        alpha_value = band;
     }
 };
 
@@ -534,18 +524,11 @@ namespace
             return 3;
         }
 
-        // A tile knows how big it is but not where it sits, so its bounds run
-        // over its own pixel centers. That is enough for whatever places it -
-        // a TranslatedData - to take it as locatable.
+        // A tile is looked up by pixel index, so its bounds are its own grid.
+        // Whatever places it - a TranslatedData - transforms those.
         rsvp::TerrainBounds get_bounds() const override
         {
-            rsvp::TerrainBounds bounds;
-            bounds.valid = true;
-            bounds.min_x = 0.0;
-            bounds.min_y = 0.0;
-            bounds.max_x = get_width() - 1;
-            bounds.max_y = get_height() - 1;
-            return bounds;
+            return pixel_grid_bounds();
         }
 
         int get_width() const override
@@ -745,7 +728,8 @@ TEST(composite_data, vicar_data_bounds_span_the_pixel_centers)
 
     // The wedge tiles in test/terrain carry their geometry in the system label
     // rather than in a SURFACE_PROJECTION_PARMS property, which is the only
-    // place VicarData::get_bounds looks, so synthesize a tile that has one.
+    // place VicarData::get_map_bounds looks, so synthesize a tile that has
+    // one.
     // LBLSIZE has to be a whole number of RECSIZE records, and the label has
     // to be padded out to it
     const size_t label_size = 512;
@@ -781,13 +765,23 @@ TEST(composite_data, vicar_data_bounds_span_the_pixel_centers)
     EXPECT_EQ(tile->get_width(), samples);
     EXPECT_EQ(tile->get_height(), lines);
 
-    // Bounds run to the last pixel, not one pixel past it
+    // Map bounds run to the last pixel, not one pixel past it
+    const auto map_bounds = tile->get_map_bounds();
+    ASSERT_TRUE(map_bounds.valid);
+    EXPECT_DOUBLE_EQ(map_bounds.min_x, x_min);
+    EXPECT_DOUBLE_EQ(map_bounds.min_y, y_min);
+    EXPECT_DOUBLE_EQ(map_bounds.max_x, x_min + (samples - 1) * x_scale);
+    EXPECT_DOUBLE_EQ(map_bounds.max_y, y_min + (lines - 1) * y_scale);
+
+    // Lookups on the tile itself take pixel indices, so that is where it
+    // says its pixels are, whatever its labels say
     const auto bounds = tile->get_bounds();
     ASSERT_TRUE(bounds.valid);
-    EXPECT_DOUBLE_EQ(bounds.min_x, x_min);
-    EXPECT_DOUBLE_EQ(bounds.min_y, y_min);
-    EXPECT_DOUBLE_EQ(bounds.max_x, x_min + (samples - 1) * x_scale);
-    EXPECT_DOUBLE_EQ(bounds.max_y, y_min + (lines - 1) * y_scale);
+    EXPECT_DOUBLE_EQ(bounds.min_x, 0.0);
+    EXPECT_DOUBLE_EQ(bounds.min_y, 0.0);
+    EXPECT_DOUBLE_EQ(bounds.max_x, samples - 1);
+    EXPECT_DOUBLE_EQ(bounds.max_y, lines - 1);
+    EXPECT_DOUBLE_EQ(bounds.pixel_reach, 1.0);
 
     ASSERT_TRUE(image_data::image_data_test_rm_directory(tmp_dir) == 0);
 }
@@ -1107,7 +1101,14 @@ TEST(composite_data, concurrent_lookups_survive_a_moved_child)
 
     // Enough moves to retire a snapshot many times over, and few enough that
     // holding on to every one of them stays cheap
-    const int num_moves = 2000;
+    const int min_moves = 2000;
+
+    // The readers must get through at least one pass while the moves land,
+    // or the moves would be testing nothing. How long a pass takes under
+    // eight-way contention for the cache depends on the build - it can
+    // exceed the minimum under a sanitizer - so keep moving until one does,
+    // within reason.
+    const int max_moves = 1000 * min_moves;
 
     std::atomic<bool> stopping {false};
     std::atomic<int> thrown {0};
@@ -1136,9 +1137,13 @@ TEST(composite_data, concurrent_lookups_survive_a_moved_child)
 
     const int passes_before_moves = passes.load();
 
-    for (int move = 1; move <= num_moves; move++)
+    int num_moves = 0;
+
+    while (num_moves < min_moves ||
+           (num_moves < max_moves && passes.load() == passes_before_moves))
     {
-        stray->move_to(stray_origin + move);
+        num_moves++;
+        stray->move_to(stray_origin + num_moves);
         std::this_thread::yield();
     }
 
@@ -1161,4 +1166,523 @@ TEST(composite_data, concurrent_lookups_survive_a_moved_child)
     EXPECT_EQ(composite.get_bounds().max_x, stray_origin + num_moves + 1);
     expect_matches_mosaic(
         composite, 0.0, 1.5, 0.25, 0.0, 4 * (SeamMosaic::GRID_SIZE - 1));
+}
+
+namespace
+{
+    // A gridded image, 4x4 unless told otherwise, that counts how often it is
+    // sampled, so a test can tell whether a composite skipped it. Band 2 is
+    // fully opaque; the data bands hold 10 + x + 4y, which bilinear
+    // interpolation reproduces exactly.
+    class CountingTile : public rsvp::ImageData
+    {
+    private:
+        mutable int samples = 0;
+        int width;
+        int height;
+
+    public:
+        static constexpr int SIZE = 4;
+
+        explicit CountingTile(int in_width = SIZE, int in_height = SIZE) :
+            width(in_width),
+            height(in_height)
+        {
+        }
+
+        int sample_count() const
+        {
+            return samples;
+        }
+
+        static double value_at(double x, double y)
+        {
+            return 10.0 + x + SIZE * y;
+        }
+
+        int get_bands() const override
+        {
+            return 3;
+        }
+
+        int get_width() const override
+        {
+            return width;
+        }
+
+        int get_height() const override
+        {
+            return height;
+        }
+
+        rsvp::TerrainBounds get_bounds() const override
+        {
+            return pixel_grid_bounds();
+        }
+
+        bool
+        get_pixel_double(double &value, int x, int y, int band) const override
+        {
+            samples++;
+
+            if (x < 0 || x >= width || y < 0 || y >= height || band < 0 ||
+                band >= 3)
+            {
+                return false;
+            }
+
+            value = (band == 2) ? 255.0 : value_at(x, y);
+            return true;
+        }
+    };
+
+    // A tile that does not say where its pixels are, as an image that has
+    // not overridden get_bounds does not. A composite has nothing to skip it
+    // by, so it must always be asked.
+    class UnboundedTile final : public CountingTile
+    {
+    public:
+        rsvp::TerrainBounds get_bounds() const override
+        {
+            return rsvp::TerrainBounds();
+        }
+    };
+
+    template <typename Composite>
+    std::shared_ptr<rsvp::CompositeData> make_composite()
+    {
+        auto composite = std::make_shared<Composite>();
+        composite->set_alpha_band(2);
+        return composite;
+    }
+
+    using CompositeFactory = std::shared_ptr<rsvp::CompositeData> (*)();
+
+    const CompositeFactory composite_factories[] = {
+        &make_composite<rsvp::AlphaBlendingCompositeData>,
+        &make_composite<rsvp::AverageCompositeData>,
+        &make_composite<rsvp::ScoredCompositeData>,
+    };
+}
+
+// Bounds are where an image's lookups find pixels, and how far past that a
+// lookup still lands on one, and both follow the image through whatever
+// wraps it.
+TEST(composite_data, bounds_follow_the_transform)
+{
+    // A gridded image on its own is looked up by pixel index, and reaches a
+    // pixel past its grid
+    const auto tile = std::make_shared<CountingTile>();
+    auto bounds = tile->get_bounds();
+    ASSERT_TRUE(bounds.valid);
+    EXPECT_DOUBLE_EQ(bounds.min_x, 0.0);
+    EXPECT_DOUBLE_EQ(bounds.max_x, CountingTile::SIZE - 1);
+    EXPECT_DOUBLE_EQ(bounds.pixel_reach, 1.0);
+
+    // A transform places the grid and stretches the reach with it
+    const auto placed =
+        std::make_shared<rsvp::TranslatedData>(tile, 10.0, 20.0, 2.0, 0.0);
+    bounds = placed->get_bounds();
+    ASSERT_TRUE(bounds.valid);
+    EXPECT_DOUBLE_EQ(bounds.min_x, 10.0);
+    EXPECT_DOUBLE_EQ(bounds.min_y, 20.0);
+    EXPECT_DOUBLE_EQ(bounds.max_x, 10.0 + 2.0 * (CountingTile::SIZE - 1));
+    EXPECT_DOUBLE_EQ(bounds.max_y, 20.0 + 2.0 * (CountingTile::SIZE - 1));
+    EXPECT_DOUBLE_EQ(bounds.pixel_reach, 2.0);
+
+    // A rotated pixel reaches further along each axis than its pitch
+    const rsvp::TranslatedData rotated(tile, 0.0, 0.0, 1.0, M_PI / 4.0);
+    EXPECT_DOUBLE_EQ(rotated.get_bounds().pixel_reach, std::sqrt(2.0));
+
+    // Offsetting values moves nothing, so the answer passes through
+    const rsvp::ZOffsetData offset(placed);
+    bounds = offset.get_bounds();
+    ASSERT_TRUE(bounds.valid);
+    EXPECT_DOUBLE_EQ(bounds.min_x, 10.0);
+    EXPECT_DOUBLE_EQ(bounds.pixel_reach, 2.0);
+
+    // An image that has not said where its pixels are has no bounds, and
+    // neither does a transform of it
+    const auto unbounded = std::make_shared<UnboundedTile>();
+    EXPECT_FALSE(unbounded->get_bounds().valid);
+    EXPECT_FALSE(rsvp::TranslatedData(unbounded).get_bounds().valid);
+
+    // A composite's bounds are the union of its children's. Its reach is
+    // known only when every child's is: a child that could be anywhere
+    // leaves a parent composite nothing safe to skip this one by.
+    rsvp::AlphaBlendingCompositeData composite;
+    EXPECT_FALSE(composite.get_bounds().valid);
+
+    composite.add_image(placed);
+    bounds = composite.get_bounds();
+    ASSERT_TRUE(bounds.valid);
+    EXPECT_DOUBLE_EQ(bounds.min_x, 10.0);
+    EXPECT_DOUBLE_EQ(bounds.pixel_reach, 2.0);
+    EXPECT_FALSE(bounds.could_reach(10.0 - 2.5, 20.0));
+    EXPECT_TRUE(bounds.could_reach(10.0 - 1.5, 20.0));
+
+    composite.add_image(unbounded);
+    bounds = composite.get_bounds();
+    ASSERT_TRUE(bounds.valid);
+    EXPECT_DOUBLE_EQ(bounds.pixel_reach, 0.0);
+    EXPECT_TRUE(bounds.could_reach(-1000.0, -1000.0));
+
+    composite.remove_image(1);
+    EXPECT_DOUBLE_EQ(composite.get_bounds().pixel_reach, 2.0);
+}
+
+// A transform over a transform used to place the inner grid as though the
+// inner transform were not there
+TEST(composite_data, nested_transforms_compose_in_bounds)
+{
+    const auto tile = std::make_shared<CountingTile>();
+    const auto inner =
+        std::make_shared<rsvp::TranslatedData>(tile, 10.0, 20.0, 2.0, 0.0);
+    const rsvp::TranslatedData outer(inner, 100.0, 200.0, 3.0, 0.0);
+
+    const auto bounds = outer.get_bounds();
+    ASSERT_TRUE(bounds.valid);
+    EXPECT_DOUBLE_EQ(bounds.pixel_reach, 3.0 * 2.0);
+    EXPECT_DOUBLE_EQ(bounds.min_x, 100.0 + 3.0 * 10.0);
+    EXPECT_DOUBLE_EQ(bounds.min_y, 200.0 + 3.0 * 20.0);
+    EXPECT_DOUBLE_EQ(bounds.max_x,
+                     100.0 + 3.0 * (10.0 + 2.0 * (CountingTile::SIZE - 1)));
+    EXPECT_DOUBLE_EQ(bounds.max_y,
+                     200.0 + 3.0 * (20.0 + 2.0 * (CountingTile::SIZE - 1)));
+
+    // The bounds really do cover the pixels: the corners of the bounds are
+    // the corners of the grid
+    double value = 0.0;
+    EXPECT_TRUE(outer.get_interpolated_pixel_double(
+        value, bounds.min_x, bounds.min_y, 0));
+    EXPECT_DOUBLE_EQ(value, CountingTile::value_at(0, 0));
+    EXPECT_TRUE(outer.get_interpolated_pixel_double(
+        value, bounds.max_x, bounds.max_y, 0));
+    const double last = CountingTile::SIZE - 1;
+    EXPECT_DOUBLE_EQ(value, CountingTile::value_at(last, last));
+}
+
+// A composite skips a child that is placed by a transform and is nowhere near
+// the point, and never skips one that does not say where its pixels are
+TEST(composite_data, a_child_without_bounds_is_never_skipped)
+{
+    const double far_away = 1000.0;
+
+    for (const CompositeFactory make : composite_factories)
+    {
+        const auto composite = make();
+
+        const auto placed_tile = std::make_shared<CountingTile>();
+        const auto placed = std::make_shared<rsvp::TranslatedData>(
+            placed_tile, far_away, far_away, 1.0, 0.0);
+        placed->set_alpha_band(2);
+
+        const auto unbounded = std::make_shared<UnboundedTile>();
+        unbounded->set_alpha_band(2);
+
+        composite->add_image(placed);
+        composite->add_image(unbounded);
+
+        // Inside the unbounded tile's pixels: it answers, and the placed tile
+        // must not be consulted
+        double value = 0.0;
+        EXPECT_TRUE(composite->get_interpolated_pixel_double(
+            value, 1.5, 1.5, 0));
+        EXPECT_DOUBLE_EQ(value, CountingTile::value_at(1.5, 1.5));
+        EXPECT_EQ(placed_tile->sample_count(), 0);
+        EXPECT_GT(unbounded->sample_count(), 0);
+
+        // Inside the placed tile: it answers, and the unbounded tile is still
+        // asked, since nothing says it is not there too
+        const int unbounded_samples = unbounded->sample_count();
+        EXPECT_TRUE(composite->get_interpolated_pixel_double(
+            value, far_away + 1.5, far_away + 1.5, 0));
+        EXPECT_DOUBLE_EQ(value, CountingTile::value_at(1.5, 1.5));
+        EXPECT_GT(placed_tile->sample_count(), 0);
+        EXPECT_GT(unbounded->sample_count(), unbounded_samples);
+    }
+}
+
+// Skipping a child by an axis-aligned box around it has to allow for how
+// far a pixel of the child reaches along each axis, which under a shear is
+// much more than the child's bounds divided by its width would suggest
+TEST(composite_data, a_sheared_child_is_not_skipped_where_it_reaches)
+{
+    // 100 samples by 2 lines, sheared so that each line is offset by 10:
+    // x = sample + 10 * line, y = line
+    const int width = 100;
+    const int height = 2;
+    const double shear = 10.0;
+
+    for (const CompositeFactory make : composite_factories)
+    {
+        const auto composite = make();
+
+        const auto tile = std::make_shared<CountingTile>(width, height);
+        const auto sheared = std::make_shared<rsvp::TranslatedData>(
+            tile, 0.0, 0.0, 1.0, shear, 0.0, 1.0);
+        sheared->set_alpha_band(2);
+        composite->add_image(sheared);
+        composite->set_interpolating(false);
+
+        // A pixel of the sheared tile reaches `shear` along x for every one
+        // it reaches along y
+        const auto bounds = sheared->get_bounds();
+        ASSERT_TRUE(bounds.valid);
+        EXPECT_DOUBLE_EQ(bounds.min_x, 0.0);
+        EXPECT_DOUBLE_EQ(bounds.max_x, (width - 1) + shear * (height - 1));
+        EXPECT_DOUBLE_EQ(bounds.pixel_reach, 1.0 + shear);
+
+        // (-3, -0.4) inverts to sample 1, line -0.4, which rounds onto the
+        // tile's pixel (1, 0), even though it lies 3 units outside the
+        // tile's bounds along x
+        double value = 0.0;
+        EXPECT_TRUE(
+            composite->get_interpolated_pixel_double(value, -3.0, -0.4, 0));
+        EXPECT_DOUBLE_EQ(value, CountingTile::value_at(1, 0));
+
+        // While a point the tile really cannot reach is still skipped
+        const int samples = tile->sample_count();
+        EXPECT_FALSE(
+            composite->get_interpolated_pixel_double(value, -20.0, -0.4, 0));
+        EXPECT_EQ(tile->sample_count(), samples);
+    }
+}
+
+// A composite remembers which band of each child carries its alpha, and a
+// child's alpha band can change after that. Changing it through
+// set_alpha_band has to reach every composite the child is in.
+TEST(composite_data, scored_composite_follows_a_changed_alpha_band)
+{
+    // Two three-band children whose bands 1 and 2 disagree about which of
+    // them scores higher, so that which band is taken as the score decides
+    // which child's band 0 the composite answers with
+    const auto plain = std::make_shared<CompositeTestImage>(3);
+
+    const auto rescaled = std::make_shared<rsvp::ZOffsetData>(
+        std::make_shared<CompositeTestImage>(3));
+    rescaled->set_offset_and_scale(0, 1000.0, 1.0);
+    rescaled->set_offset_and_scale(1, 0.0, 100.0);
+    rescaled->set_offset_and_scale(2, 0.0, 0.01);
+
+    plain->set_alpha_band(2);
+    rescaled->set_alpha_band(2);
+
+    rsvp::ScoredCompositeData composite;
+    composite.add_image(plain);
+    composite.add_image(rescaled);
+
+    // Scored by band 2, the plain child wins
+    double value = 0.0;
+    ASSERT_TRUE(composite.get_interpolated_pixel_double(value, 1.0, 1.0, 0));
+    EXPECT_DOUBLE_EQ(value, 5.0);
+
+    // Scored by band 1, the rescaled one does
+    plain->set_alpha_band(1);
+    rescaled->set_alpha_band(1);
+
+    ASSERT_TRUE(composite.get_interpolated_pixel_double(value, 1.0, 1.0, 0));
+    EXPECT_DOUBLE_EQ(value, 1005.0);
+}
+
+// Skipping a child by its bounds must leave room for the half pixel an
+// uninterpolated lookup rounds across
+TEST(composite_data, skipping_leaves_room_for_nearest_neighbor_rounding)
+{
+    for (const CompositeFactory make : composite_factories)
+    {
+        const auto composite = make();
+
+        const auto tile = std::make_shared<CountingTile>();
+        const auto placed =
+            std::make_shared<rsvp::TranslatedData>(tile, 0.0, 0.0, 1.0, 0.0);
+        placed->set_alpha_band(2);
+        composite->add_image(placed);
+        composite->set_interpolating(false);
+
+        const double last = CountingTile::SIZE - 1;
+
+        double value = 0.0;
+        EXPECT_TRUE(
+            composite->get_interpolated_pixel_double(value, -0.4, -0.4, 0));
+        EXPECT_DOUBLE_EQ(value, CountingTile::value_at(0, 0));
+
+        EXPECT_TRUE(composite->get_interpolated_pixel_double(
+            value, last + 0.4, last + 0.4, 0));
+        EXPECT_DOUBLE_EQ(value, CountingTile::value_at(last, last));
+
+        EXPECT_FALSE(
+            composite->get_interpolated_pixel_double(value, -0.6, -0.6, 0));
+        EXPECT_FALSE(composite->get_interpolated_pixel_double(
+            value, last + 0.6, last + 0.6, 0));
+    }
+}
+
+// The seam and clamped fallbacks skip children by their bounds like the main
+// loops do, and so must also decline to skip a child that does not say where
+// its pixels are - whether that child is bare or wrapped in an offset
+TEST(composite_data, seam_fallbacks_never_skip_a_child_without_bounds)
+{
+    for (const bool wrap_in_offset : {false, true})
+    {
+        for (const CompositeFactory make : composite_factories)
+        {
+            const auto composite = make();
+
+            // Pixels 0..3 in the composite's coordinates, without saying so
+            const auto labelled_tile = std::make_shared<UnboundedTile>();
+            std::shared_ptr<rsvp::ImageData> labelled = labelled_tile;
+            if (wrap_in_offset)
+            {
+                labelled = std::make_shared<rsvp::ZOffsetData>(labelled_tile);
+            }
+            labelled->set_alpha_band(2);
+
+            // Pixels 4..7, abutting it with a one-pixel seam between
+            const auto placed_tile = std::make_shared<CountingTile>();
+            const auto placed = std::make_shared<rsvp::TranslatedData>(
+                placed_tile, CountingTile::SIZE, 0.0, 1.0, 0.0);
+            placed->set_alpha_band(2);
+
+            composite->add_image(labelled);
+            composite->add_image(placed);
+
+            // Neither tile covers the seam on its own
+            const double seam_x = CountingTile::SIZE - 0.6;
+            const double seam_y = 1.5;
+
+            double labelled_value = 0.0;
+            double placed_value = 0.0;
+            EXPECT_FALSE(labelled->get_interpolated_pixel_double(
+                labelled_value, seam_x, seam_y, 0));
+            EXPECT_FALSE(placed->get_interpolated_pixel_double(
+                placed_value, seam_x, seam_y, 0));
+
+            // The labelled tile's last column has a weight of 0.6 here and
+            // the placed tile's first column 0.4, so together they enclose
+            // the point and the composite reconstructs it
+            const double labelled_edge =
+                CountingTile::value_at(CountingTile::SIZE - 1, seam_y);
+            const double placed_edge = CountingTile::value_at(0, seam_y);
+
+            double value = 0.0;
+            ASSERT_TRUE(composite->get_interpolated_pixel_double(
+                value, seam_x, seam_y, 0));
+
+            if (dynamic_cast<rsvp::ScoredCompositeData *>(composite.get()))
+            {
+                // A scored composite takes the nearest tile's value
+                EXPECT_DOUBLE_EQ(value, labelled_edge);
+            }
+            else
+            {
+                EXPECT_DOUBLE_EQ(value,
+                                 0.6 * labelled_edge + 0.4 * placed_edge);
+            }
+
+            // Off the labelled tile's far edge, only it can supply a clamped
+            // sample, and it must not be ruled out
+            double weight = 0.0;
+            ASSERT_TRUE(composite->get_clamped_pixel_double(
+                value, weight, -0.5, seam_y, 0));
+            EXPECT_DOUBLE_EQ(weight, 0.5);
+            EXPECT_DOUBLE_EQ(value, CountingTile::value_at(0, seam_y));
+        }
+    }
+}
+
+// A child with data at a point but not the alpha band it declares was
+// labelled with a band it does not have. A blending composite reports that
+// as the mistake it is rather than quietly leaving the pixel out of the
+// mosaic; a scored composite, which only ranks children by that band, skips
+// the child as it always has. Away from the child it is just no data.
+TEST(composite_data, a_missing_alpha_band_is_an_error_where_the_data_is)
+{
+    for (const CompositeFactory make : composite_factories)
+    {
+        const auto composite = make();
+
+        const auto image = std::make_shared<CompositeTestImage>(3);
+        image->set_alpha_band(7);
+        composite->add_image(image);
+
+        double value = 0.0;
+
+        if (dynamic_cast<rsvp::ScoredCompositeData *>(composite.get()))
+        {
+            EXPECT_NO_THROW(EXPECT_FALSE(
+                composite->get_interpolated_pixel_double(value, 1.0, 1.0, 0)));
+        }
+        else
+        {
+            EXPECT_THROW(
+                composite->get_interpolated_pixel_double(value, 1.0, 1.0, 0),
+                std::runtime_error);
+        }
+
+        EXPECT_NO_THROW(EXPECT_FALSE(composite->get_interpolated_pixel_double(
+            value, -100.0, -100.0, 0)));
+    }
+}
+
+namespace
+{
+    // A child whose set_alpha_band keeps the band to itself rather than
+    // reaching ImageData::set_alpha_band, so nothing it does invalidates a
+    // composite's cached geometry
+    class SelfKeepingAlphaImage final : public CompositeTestImage
+    {
+    private:
+        int own_alpha_band = -1;
+
+    public:
+        SelfKeepingAlphaImage() :
+            CompositeTestImage(3)
+        {
+        }
+
+        void set_alpha_band(const int band) override
+        {
+            own_alpha_band = band;
+        }
+
+        int get_alpha_band() const override
+        {
+            return own_alpha_band;
+        }
+    };
+}
+
+// A scored composite scores each child by the band the child says it
+// scores by now, not the one it said when the composite last looked
+TEST(composite_data, scored_composite_asks_a_child_for_its_alpha_band)
+{
+    const auto plain = std::make_shared<SelfKeepingAlphaImage>();
+
+    // The rescaled child's band 2 scores between the plain child's band 2
+    // and its band 1, so which of those the plain child is scored by decides
+    // the winner, and the rescaled child never has to change
+    const auto rescaled = std::make_shared<rsvp::ZOffsetData>(
+        std::make_shared<CompositeTestImage>(3));
+    rescaled->set_offset_and_scale(0, 1000.0, 1.0);
+    rescaled->set_offset_and_scale(2, 0.0, 0.5);
+
+    plain->set_alpha_band(2);
+    rescaled->set_alpha_band(2);
+
+    rsvp::ScoredCompositeData composite;
+    composite.add_image(plain);
+    composite.add_image(rescaled);
+
+    // Scored by band 2, the plain child wins
+    double value = 0.0;
+    ASSERT_TRUE(composite.get_interpolated_pixel_double(value, 1.0, 1.0, 0));
+    EXPECT_DOUBLE_EQ(value, 5.0);
+
+    // Scored by band 1, the rescaled one does, even though the plain child
+    // told nobody that its band moved
+    plain->set_alpha_band(1);
+
+    ASSERT_TRUE(composite.get_interpolated_pixel_double(value, 1.0, 1.0, 0));
+    EXPECT_DOUBLE_EQ(value, 1005.0);
 }

@@ -3,7 +3,7 @@
 #include <stdexcept>
 
 #include <fstream>
-#include <iostream>
+#include <locale>
 #include <sstream>
 
 
@@ -28,21 +28,43 @@ namespace rsvp
 
         std::shared_ptr<CSVData> result(new CSVData());
 
+        // One stream for the whole file rather than one per field, which is
+        // what made reading a large CSV slow. It reads numbers the way the C
+        // locale writes them whatever locale the process has been switched
+        // to: `strtod` would honour a comma-decimal `LC_NUMERIC` and read
+        // "2.5" as 2.
+        std::istringstream field_stream;
+        field_stream.imbue(std::locale::classic());
+
         std::string str_line;
         while (std::getline(csv_file, str_line))
         {
-            std::istringstream s(str_line);
-            std::vector<double> c;
-            std::string str_field;
-            while (std::getline(s, str_field, ','))
+            std::vector<double> row;
+
+            // A field is whatever lies between commas. A field that is not a
+            // number reads as 0, and a trailing comma does not add a field.
+            for (size_t start = 0; start < str_line.size();)
             {
-                std::stringstream ss;
-                ss << str_field;
-                double value = 0;
-                ss >> value;
-                c.push_back(value);
+                const size_t comma = str_line.find(',', start);
+                const size_t end =
+                    (comma == std::string::npos) ? str_line.size() : comma;
+
+                field_stream.clear();
+                field_stream.str(str_line.substr(start, end - start));
+
+                double value = 0.0;
+                field_stream >> value;
+                row.push_back(value);
+
+                if (comma == std::string::npos)
+                {
+                    break;
+                }
+
+                start = comma + 1;
             }
-            result->data_array.push_back(c);
+
+            result->data_array.push_back(std::move(row));
         }
 
         if (result->data_array.empty() or result->data_array.at(0).empty())
@@ -50,15 +72,7 @@ namespace rsvp
             throw std::runtime_error("CSV file " + filename + " is empty");
         }
 
-        const size_t xi_size = result->data_array.size();
         const size_t yi_size = result->data_array.at(0).size();
-
-        if (xi_size < 1 or yi_size < 1)
-        {
-            throw std::runtime_error("CSV file too small it seems to be " +
-                                     std::to_string(xi_size) + " by " +
-                                     std::to_string(yi_size));
-        }
 
         for (std::vector<std::vector<double>>::const_iterator iter =
                  result->data_array.begin();

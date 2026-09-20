@@ -23,6 +23,45 @@ namespace rsvp
         std::vector<double> offsets;
         std::vector<double> scales;
 
+        /**
+         * @brief Whether `band` has an offset and scale of its own.
+         *
+         * Checked against the tables rather than the stored image's band
+         * count, which would cost a walk down the wrappers on every pixel.
+         * The tables are sized to that count when this is constructed, and
+         * grow to it again when a band the stored image has gained since is
+         * given an offset and scale. They are never longer than it, so an
+         * entry means the stored image had the band when it was made.
+         */
+        bool has_band(int band) const
+        {
+            return band >= 0 && static_cast<size_t>(band) < scales.size();
+        }
+
+        /**
+         * @brief Whether `band` is one the stored image has.
+         *
+         * A band with an offset and scale of its own is known to be, without
+         * asking. Only a band without one - a band the stored image gained
+         * after the tables were sized, or one it never had - costs the walk
+         * down to it to find out.
+         */
+        bool band_in_range(int band) const
+        {
+            return has_band(band) || (band >= 0 && band < get_bands());
+        }
+
+        /**
+         * @brief Offset and scale one raw value of `band`.
+         *
+         * A band without an offset and scale of its own passes through
+         * unchanged.
+         */
+        double transform(const double raw, const int band) const
+        {
+            return has_band(band) ? (raw * scales[band]) + offsets[band] : raw;
+        }
+
     public:
         /**
          * @brief Construct a ZOffsetData with identity offset and scaling.
@@ -56,6 +95,27 @@ namespace rsvp
          * @return The alpha image band
          */
         int get_alpha_band() const override;
+
+        /**
+         * @brief Enable or disable interpolation for the image data.
+         *
+         * For ZOffsetData, this field is set locally but is also passed
+         * through to the stored image, which is the one that interpolates.
+         *
+         * @param[in] enable Whether to enable or disable interpolation
+         */
+        void set_interpolating(bool enable) override;
+
+        /**
+         * @brief Get whether or not interpolation is enabled for the image
+         * data.
+         *
+         * For ZOffsetData, the interpolation state of the stored image is
+         * returned if available.
+         *
+         * @return True if interpolation is enabled, false otherwise.
+         */
+        int get_interpolating() const override;
 
         // Return an exact pixel value as a double
         bool
@@ -96,7 +156,22 @@ namespace rsvp
                                         int band) const override;
 
         /**
+         * @brief Sample several bands of the stored image at once, and offset
+         * and scale each.
+         *
+         * @see ImageData::get_interpolated_bands_double
+         */
+        bool get_interpolated_bands_double(double *values,
+                                           const int *bands,
+                                           int count,
+                                           double x,
+                                           double y) const override;
+
+        /**
          * @brief Set the offset and scale for a band of the stored image.
+         *
+         * A band the stored image does not have is ignored, as is a
+         * negative one.
          *
          * @param band      The band of the image to transform
          * @param offset    The offset to apply to the band's data
@@ -114,6 +189,15 @@ namespace rsvp
         int get_width() const override
         {
             return img ? img->get_width() : 0;
+        }
+
+        /**
+         * @brief Where the stored image sits. Offsetting and scaling values
+         * does not move pixels, so the answer is the stored image's own.
+         */
+        TerrainBounds get_bounds() const override
+        {
+            return img ? img->get_bounds() : TerrainBounds();
         }
     };
 }
