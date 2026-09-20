@@ -31,14 +31,24 @@ namespace rsvp
         //     [ X ]   [ txx tyx t_x ]   [ sample ]
         //     [ Y ] = [ txy tyy t_y ] * [  line  ]
         //     [ 1 ]   [  0   0   1  ]   [   1    ]
-        double t_x, t_y, txx, tyx, txy, tyy;
+        double t_x = 0.0;
+        double t_y = 0.0;
+        double txx = 0.0;
+        double tyx = 0.0;
+        double txy = 0.0;
+        double tyy = 0.0;
 
 
         // Affine transformation matrix:
         //     [ sample ]   [ ixx iyx i_x ]   [ X ]
         //     [  line  ] = [ ixy iyy i_y ] * [ Y ]
         //     [   1    ]   [  0   0   1  ]   [ 1 ]
-        double i_x, i_y, ixx, iyx, ixy, iyy;
+        double i_x = 0.0;
+        double i_y = 0.0;
+        double ixx = 0.0;
+        double iyx = 0.0;
+        double ixy = 0.0;
+        double iyy = 0.0;
 
         const std::shared_ptr<ImageData> transformed_image;
 
@@ -183,6 +193,29 @@ namespace rsvp
             return transformed_image ? transformed_image->get_height() : 0;
         }
 
+        /**
+         * @brief Sample several bands of the stored image at one transformed
+         * point.
+         *
+         * @see ImageData::get_interpolated_bands_double
+         */
+        bool get_interpolated_bands_double(double *values,
+                                           const int *bands,
+                                           int count,
+                                           double x,
+                                           double y) const override;
+
+        /**
+         * @brief Where this transform puts the stored image's pixels.
+         *
+         * The stored image's bounds, transformed, with its reach scaled up by
+         * the most the transform stretches anything.
+         *
+         * @return Invalid bounds if the stored image does not know its own.
+         * An image that holds a grid reports it by overriding `get_bounds`
+         * with `pixel_grid_bounds`; one that does not is in an unknown
+         * place, which is never skipped.
+         */
         TerrainBounds get_bounds() const override;
     };
 }

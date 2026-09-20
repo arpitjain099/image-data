@@ -217,7 +217,35 @@ namespace rsvp
         };
 
     private:
-        std::string filepath;
+        /**
+         * @brief Whether all four corners of a bilinear sample are inside the
+         * image.
+         *
+         * The far corners are never nearer the origin than the near ones, so
+         * four tests cover all four corners.
+         */
+        bool corners_in_image(const BilinearCorners &corners) const
+        {
+            return corners.x0 >= 0 && corners.y0 >= 0 && corners.x1 < NS &&
+                corners.y1 < NL;
+        }
+
+        /**
+         * @brief Bilinearly interpolate one band from corners already checked
+         * to be inside the image, and a band already checked to exist.
+         */
+        double interpolate_corners(const BilinearCorners &corners,
+                                   const int band) const
+        {
+            const double *plane = pixel_data.get() + pixel_index(0, 0, band);
+            const double *upper = plane + static_cast<size_t>(corners.y0) * NS;
+            const double *lower = plane + static_cast<size_t>(corners.y1) * NS;
+
+            return upper[corners.x0] * corners.weight_ul +
+                upper[corners.x1] * corners.weight_ur +
+                lower[corners.x0] * corners.weight_ll +
+                lower[corners.x1] * corners.weight_lr;
+        }
 
         // Image comments
         std::string comments;
@@ -228,9 +256,9 @@ namespace rsvp
                            std::unordered_map<std::string, std::string>>
             label_values;
 
-        int NL; // Number of lines
-        int NS; // Number of samples
-        int NB; // Number of bands
+        int NL = 0; // Number of lines
+        int NS = 0; // Number of samples
+        int NB = 0; // Number of bands
 
         /**
          *                 N1 -->
@@ -245,17 +273,15 @@ namespace rsvp
          *      v   |                  |
          *          +------------------+
          */
-        int N1 {}; // Size of first (fastest-varying) dimension.
-        int N2 {}; // Size of second dimension.
-        int N3 {}; // Size of third (slowest-varying) dimension.
+        int N1 = 0; // Size of first (fastest-varying) dimension.
+        int N2 = 0; // Size of second dimension.
+        int N3 = 0; // Size of third (slowest-varying) dimension.
 
-        int pds_bytes; // Number of bytes of PDS header at the tippy-top of the
-                       // file
-        int lblsize; // Number of bytes of vicar header between the PDS header
-                     // and the image
+        int lblsize = 0; // Number of bytes of vicar header between the PDS
+                         // header and the image
 
-        int NBB; // Number of bytes of binary prefix before each record
-        int NLB; // Number of lines of binary header at the top of the file
+        int NBB = 0; // Number of bytes of binary prefix before each record
+        int NLB = 0; // Number of lines of binary header at the top of the file
 
         std::unique_ptr<double[]>
             pixel_data; // Pixel data that has been re-shuffled and
@@ -265,12 +291,13 @@ namespace rsvp
                         // accessed separately therefore keeping large
                         // portions of this buffer in cache memory.
 
-        int recsize {}; // Size of a single record
+        int recsize = 0; // Size of a single record
 
-        bool int_opposite_endian;  // True if the integer data is stored in a
-                                   // non-native endianness
-        bool real_opposite_endian; // True if the floating-point data is stored
-                                   // in a non-native endianness
+        bool int_opposite_endian = false; // True if the integer data is
+                                          // stored in a non-native endianness
+        bool real_opposite_endian = false; // True if the floating-point data
+                                           // is stored in a non-native
+                                           // endianness
 
         DataFormat format = BYTE;
         DataOrg org = BSQ;
@@ -278,6 +305,15 @@ namespace rsvp
         IntFormat intfmt = LOW;
         RealFormat realfmt = IEEE;
 
+        /**
+         * @brief The offset of a pixel within `pixel_data`, which is always
+         * organized as BSQ (no interlacing).
+         */
+        size_t pixel_index(int sample, int line, int band) const
+        {
+            return static_cast<size_t>(band) * NL * NS +
+                static_cast<size_t>(line) * NS + static_cast<size_t>(sample);
+        }
 
     protected:
         /**
@@ -325,6 +361,10 @@ namespace rsvp
         /*
          * @brief Get a pixel of the image as a double value
          *
+         * Final because the interpolating lookups and `write_vicarfile` read
+         * the pixel buffer directly rather than through this, so an override
+         * would be honoured by some lookups and not others.
+         *
          * @param value Output variable, the value of the pixel
          * @param sample The x coord of the pixel
          * @param line The y coord of the pixel
@@ -335,7 +375,7 @@ namespace rsvp
         inline bool get_pixel_double(double &value,
                                      int sample,
                                      int line,
-                                     int band) const override
+                                     int band) const final
         {
             if (line < 0 || sample < 0 || band < 0)
             {
@@ -347,10 +387,81 @@ namespace rsvp
                 return false;
             }
 
-            // pixel_data is always organized as BSQ
-            // (no interlacing)
-            value = pixel_data[static_cast<size_t>(band * (NL * NS) + line * NS +
-                                                   sample)];
+            value = pixel_data[pixel_index(sample, line, band)];
+            return true;
+        }
+
+        /**
+         * @brief Bilinearly interpolate straight out of the pixel buffer.
+         *
+         * One band through the several-band path, which is where the fast
+         * path lives.
+         *
+         * @see get_interpolated_bands_double
+         */
+        bool get_interpolated_pixel_double(double &value,
+                                           double x,
+                                           double y,
+                                           int band) const override
+        {
+            return get_interpolated_bands_double(&value, &band, 1, x, y);
+        }
+
+        /**
+         * @brief Interpolate several bands from the same four corners.
+         *
+         * The default implementation fetches each of the four corners through
+         * a virtual call that checks its bounds on its own. This is the image
+         * at the bottom of every terrain stack, so check the four corners at
+         * once and read them directly. The arithmetic is the same as the
+         * default's, in the same order, so the result is identical.
+         *
+         * The uninterpolated branch is spelled out rather than left to the
+         * default, which asks for the bands one at a time through
+         * `get_interpolated_pixel_double` - and that comes straight back
+         * here.
+         *
+         * @see ImageData::get_interpolated_bands_double
+         */
+        bool get_interpolated_bands_double(double *values,
+                                           const int *bands,
+                                           const int count,
+                                           const double x,
+                                           const double y) const override
+        {
+            if (!get_interpolating())
+            {
+                const int sample = round_to_int(x);
+                const int line = round_to_int(y);
+
+                for (int i = 0; i < count; i++)
+                {
+                    if (!get_pixel_double(values[i], sample, line, bands[i]))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            const BilinearCorners corners = bilinear_corners(x, y);
+
+            if (!corners_in_image(corners))
+            {
+                return false;
+            }
+
+            for (int i = 0; i < count; i++)
+            {
+                if (bands[i] < 0 || bands[i] >= NB)
+                {
+                    return false;
+                }
+
+                values[i] = interpolate_corners(corners, bands[i]);
+            }
+
             return true;
         }
 
@@ -536,7 +647,29 @@ namespace rsvp
             return NB;
         }
 
-        TerrainBounds get_bounds() const override;
+        /**
+         * @brief The pixel grid, in pixel indices.
+         *
+         * A bare VICAR image is looked up by sample and line, so that is where
+         * its pixels are. Where its labels say it sits in the world is
+         * `get_map_bounds`.
+         */
+        TerrainBounds get_bounds() const override
+        {
+            return pixel_grid_bounds();
+        }
+
+        /**
+         * @brief Where the SURFACE_PROJECTION_PARMS labels place this image
+         * in the world.
+         *
+         * Not `get_bounds`: lookups on a bare VICAR image take pixel indices,
+         * not world coordinates, so a composite must not skip it by these.
+         *
+         * @return Bounds over the pixel centers, in meters, or invalid bounds
+         * if the labels do not place the image.
+         */
+        TerrainBounds get_map_bounds() const;
 
         bool get_camera_cahv_frame(std::string &frame) const;
 
